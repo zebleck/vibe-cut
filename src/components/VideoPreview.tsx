@@ -16,31 +16,50 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
   const pendingSeekRef = useRef<number | null>(null);
 
   useEffect(() => {
-    const videoTrack = project.tracks.find(t => t.type === 'video');
-    const audioTrack = project.tracks.find(t => t.type === 'audio');
+    const videoTracks = project.tracks.filter(t => t.type === 'video');
+    const audioTracks = project.tracks.filter(t => t.type === 'audio');
 
-    // Find clips at current time
-    const videoClip = videoTrack ? findClipAtTime(videoTrack, currentTime, project.mediaFiles) : null;
-    const audioClip = audioTrack ? findClipAtTime(audioTrack, currentTime, project.mediaFiles) : null;
+    // Find clips at current time - search all tracks (first track with a clip wins)
+    let videoClip = null;
+    for (const track of videoTracks) {
+      const clip = findClipAtTime(track, currentTime, project.mediaFiles);
+      if (clip) {
+        videoClip = clip;
+        break;
+      }
+    }
+
+    let audioClip = null;
+    for (const track of audioTracks) {
+      const clip = findClipAtTime(track, currentTime, project.mediaFiles);
+      if (clip) {
+        audioClip = clip;
+        break;
+      }
+    }
 
     // Update video
     if (videoRef.current && videoClip) {
       const mediaFile = project.mediaFiles.find(m => m.id === videoClip.mediaId);
       if (mediaFile) {
         setHasVideoAtTime(true);
+        const clipTime = currentTime - videoClip.startTime + videoClip.trimStart;
+
         try {
           // Check if we need to change the source (compare by mediaId, not URL string)
           if (currentMediaIdRef.current !== mediaFile.id) {
             currentMediaIdRef.current = mediaFile.id;
+            pendingSeekRef.current = clipTime;
             videoRef.current.src = mediaFile.url;
             videoRef.current.load();
-          }
-          const clipTime = currentTime - videoClip.startTime + videoClip.trimStart;
-          // Only seek if video is ready and time difference is significant
-          if (videoRef.current.readyState >= 1) {
+          } else if (videoRef.current.readyState >= 1) {
+            // Only seek if video is ready and time difference is significant
             if (Math.abs(videoRef.current.currentTime - clipTime) > 0.05) {
               videoRef.current.currentTime = clipTime;
             }
+          } else {
+            // Store pending seek for when video loads
+            pendingSeekRef.current = clipTime;
           }
         } catch (error) {
           console.warn('Error updating video preview:', error);
@@ -49,6 +68,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     } else {
       setHasVideoAtTime(false);
       currentMediaIdRef.current = null;
+      pendingSeekRef.current = null;
       if (videoRef.current && videoRef.current.src) {
         videoRef.current.pause();
         videoRef.current.removeAttribute('src');
@@ -81,6 +101,22 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
       audioRef.current.load();
     }
   }, [project, currentTime]);
+
+  // Handle pending seek when video loads
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const handleLoadedMetadata = () => {
+      if (pendingSeekRef.current !== null) {
+        video.currentTime = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+      }
+    };
+
+    video.addEventListener('loadedmetadata', handleLoadedMetadata);
+    return () => video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+  }, []);
 
   useEffect(() => {
     if (videoRef.current) {

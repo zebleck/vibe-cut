@@ -77,6 +77,24 @@ export function useProject() {
     });
   }, []);
 
+  const reorderTracks = useCallback((fromIndex: number, toIndex: number) => {
+    setProject(prev => {
+      if (fromIndex === toIndex) return prev;
+      if (fromIndex < 0 || fromIndex >= prev.tracks.length) return prev;
+      if (toIndex < 0 || toIndex >= prev.tracks.length) return prev;
+
+      const newTracks = [...prev.tracks];
+      const [removed] = newTracks.splice(fromIndex, 1);
+      newTracks.splice(toIndex, 0, removed);
+
+      return {
+        ...prev,
+        tracks: newTracks,
+        updatedAt: Date.now(),
+      };
+    });
+  }, []);
+
   const addClipToTrack = useCallback((trackId: string, mediaId: string, startTime: number) => {
     setProject(prev => {
       const track = prev.tracks.find(t => t.id === trackId);
@@ -128,7 +146,7 @@ export function useProject() {
       if (!mediaFile) return prev;
 
       const framerate = mediaFile.framerate || prev.framerate || 30;
-      
+
       const quantizedUpdates: Partial<Clip> = { ...updates };
       if (updates.startTime !== undefined) {
         quantizedUpdates.startTime = Math.round(updates.startTime * framerate) / framerate;
@@ -146,6 +164,71 @@ export function useProject() {
           c.id === clipId ? { ...c, ...quantizedUpdates } : c
         ),
       }));
+
+      const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
+
+      return {
+        ...prev,
+        tracks: updatedTracks,
+        duration,
+        updatedAt: Date.now(),
+      };
+    });
+  }, []);
+
+  const moveClipToTrack = useCallback((clipId: string, targetTrackId: string, newStartTime?: number) => {
+    setProject(prev => {
+      // Find the clip and its current track
+      let sourceTrack: Track | undefined;
+      let clip: Clip | undefined;
+      for (const track of prev.tracks) {
+        const found = track.clips.find(c => c.id === clipId);
+        if (found) {
+          clip = found;
+          sourceTrack = track;
+          break;
+        }
+      }
+
+      if (!clip || !sourceTrack) return prev;
+
+      const targetTrack = prev.tracks.find(t => t.id === targetTrackId);
+      if (!targetTrack) return prev;
+
+      // Only allow moving between tracks of the same type
+      if (sourceTrack.type !== targetTrack.type) return prev;
+
+      // If already on the target track, just update position if provided
+      if (sourceTrack.id === targetTrackId) {
+        if (newStartTime !== undefined) {
+          return {
+            ...prev,
+            tracks: prev.tracks.map(track => ({
+              ...track,
+              clips: track.clips.map(c =>
+                c.id === clipId ? { ...c, startTime: newStartTime } : c
+              ),
+            })),
+            updatedAt: Date.now(),
+          };
+        }
+        return prev;
+      }
+
+      // Move clip to target track
+      const updatedClip = newStartTime !== undefined
+        ? { ...clip, startTime: newStartTime }
+        : clip;
+
+      const updatedTracks = prev.tracks.map(track => {
+        if (track.id === sourceTrack!.id) {
+          return { ...track, clips: track.clips.filter(c => c.id !== clipId) };
+        }
+        if (track.id === targetTrackId) {
+          return { ...track, clips: [...track.clips, updatedClip] };
+        }
+        return track;
+      });
 
       const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
 
@@ -386,8 +469,10 @@ export function useProject() {
     addMediaFile,
     addTrack,
     deleteTrack,
+    reorderTracks,
     addClipToTrack,
     updateClip,
+    moveClipToTrack,
     deleteClip,
     deleteClips,
     closeGaps,

@@ -22,6 +22,8 @@ interface TimelineProps {
   onZoomChange: (zoom: number) => void;
   onScrollChange: (scrollX: number) => void;
   onAddTrack: (type: 'video' | 'audio') => void;
+  onReorderTracks: (fromIndex: number, toIndex: number) => void;
+  onMoveClipToTrack: (clipId: string, targetTrackId: string, newStartTime?: number) => void;
   draggedMedia?: MediaFile | null;
   onAddClipToTrack?: (trackId: string, mediaId: string, startTime: number) => void;
 }
@@ -43,6 +45,8 @@ export function Timeline({
   onZoomChange,
   onScrollChange,
   onAddTrack,
+  onReorderTracks,
+  onMoveClipToTrack,
   draggedMedia,
   onAddClipToTrack,
 }: TimelineProps) {
@@ -59,6 +63,14 @@ export function Timeline({
     initialEndTime: number;
   } | null>(null);
   const [snapIndicator, setSnapIndicator] = useState<number | null>(null);
+  const [dropIndicator, setDropIndicator] = useState<{
+    time: number;
+    trackId: string;
+    duration: number;
+  } | null>(null);
+  const [draggingTrackIndex, setDraggingTrackIndex] = useState<number | null>(null);
+  const [dragOverTrackIndex, setDragOverTrackIndex] = useState<number | null>(null);
+  const [clipTargetTrackId, setClipTargetTrackId] = useState<string | null>(null);
 
   // Track label width offset (matches CSS .track-label width)
   const TRACK_LABEL_WIDTH = 120;
@@ -87,14 +99,18 @@ export function Timeline({
         const newZoom = Math.max(1, Math.min(500, zoom + delta));
         onZoomChange(newZoom);
       } else {
-        // Scroll horizontally
-        onScrollChange(Math.max(0, scrollX + e.deltaY));
+        // Scroll horizontally (support both vertical wheel and horizontal trackpad)
+        const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY;
+        // Clamp scroll to valid range (0 to content width)
+        const maxScroll = Math.max(0, timeToPixels(project.duration || 10, zoom) - 200);
+        const newScrollX = Math.max(0, Math.min(maxScroll, scrollX + delta));
+        onScrollChange(newScrollX);
       }
     };
 
     element.addEventListener('wheel', handleWheel, { passive: false });
     return () => element.removeEventListener('wheel', handleWheel);
-  }, [zoom, scrollX, onZoomChange, onScrollChange]);
+  }, [zoom, scrollX, onZoomChange, onScrollChange, project.duration]);
 
   const handleTimelineClick = (e: MouseEvent<HTMLDivElement>) => {
     // Only set playhead when clicking on empty space (track background), not on clips
@@ -141,6 +157,7 @@ export function Timeline({
       const rect = timelineRef.current.getBoundingClientRect();
       // Mouse position relative to track content area
       const mouseX = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+      const mouseY = e.clientY - rect.top;
       const x = mouseX - dragOffset;
       let newStartTime = Math.max(0, pixelsToTime(x, zoom));
 
@@ -153,6 +170,18 @@ export function Timeline({
         } else {
           setSnapIndicator(null);
         }
+      }
+
+      // Calculate which track the clip is being dragged over
+      const trackIndex = Math.floor(mouseY / trackHeight);
+      const targetTrack = project.tracks[trackIndex];
+      const currentClip = project.tracks.flatMap(t => t.clips).find(c => c.id === draggingClip);
+      const currentTrack = project.tracks.find(t => t.clips.some(c => c.id === draggingClip));
+
+      if (targetTrack && currentTrack && targetTrack.type === currentTrack.type) {
+        setClipTargetTrackId(targetTrack.id);
+      } else {
+        setClipTargetTrackId(currentTrack?.id || null);
       }
 
       onClipUpdate(draggingClip, { startTime: newStartTime });
@@ -207,9 +236,20 @@ export function Timeline({
   };
 
   const handleMouseUp = () => {
+    // If dragging a clip and there's a target track, move it
+    if (draggingClip && clipTargetTrackId) {
+      const currentTrack = project.tracks.find(t => t.clips.some(c => c.id === draggingClip));
+      if (currentTrack && currentTrack.id !== clipTargetTrackId) {
+        const clip = currentTrack.clips.find(c => c.id === draggingClip);
+        if (clip) {
+          onMoveClipToTrack(draggingClip, clipTargetTrackId, clip.startTime);
+        }
+      }
+    }
     setDraggingClip(null);
     setResizingClip(null);
     setSnapIndicator(null);
+    setClipTargetTrackId(null);
   };
 
   // Keyboard shortcuts
@@ -301,36 +341,92 @@ export function Timeline({
             const rect = timelineRef.current?.getBoundingClientRect();
             if (rect) {
               const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
-              let time = pixelsToTime(x, zoom);
-              if (snapEnabled) {
-                const snapPoints = findSnapPoints(project.tracks, playhead);
-                const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
-                time = snapped.time;
-              }
-              const track = project.tracks.find(t => t.type === draggedMedia.type);
-              if (track && onAddClipToTrack) {
+              const y = e.clientY - rect.top;
+              const trackIndex = Math.floor(y / trackHeight);
+              const track = project.tracks[trackIndex];
+
+              if (track && track.type === draggedMedia.type && onAddClipToTrack) {
+                let time = pixelsToTime(x, zoom);
+                if (snapEnabled) {
+                  const snapPoints = findSnapPoints(project.tracks, playhead);
+                  const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
+                  time = snapped.time;
+                }
                 onAddClipToTrack(track.id, draggedMedia.id, Math.max(0, time));
               }
             }
+            setDropIndicator(null);
           }
         }}
         onDragOver={(e) => {
           if (draggedMedia) {
             e.preventDefault();
             e.dataTransfer.dropEffect = 'copy';
+            const rect = timelineRef.current?.getBoundingClientRect();
+            if (rect) {
+              const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+              const y = e.clientY - rect.top;
+              const trackIndex = Math.floor(y / trackHeight);
+              const track = project.tracks[trackIndex];
+
+              if (track && track.type === draggedMedia.type) {
+                let time = pixelsToTime(x, zoom);
+                if (snapEnabled) {
+                  const snapPoints = findSnapPoints(project.tracks, playhead);
+                  const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
+                  time = snapped.time;
+                }
+                setDropIndicator({
+                  time: Math.max(0, time),
+                  trackId: track.id,
+                  duration: draggedMedia.duration,
+                });
+              } else {
+                setDropIndicator(null);
+              }
+            }
+          }
+        }}
+        onDragLeave={(e) => {
+          // Only clear if leaving the tracks area entirely
+          const rect = timelineRef.current?.getBoundingClientRect();
+          if (rect) {
+            const { clientX, clientY } = e;
+            if (
+              clientX < rect.left ||
+              clientX > rect.right ||
+              clientY < rect.top ||
+              clientY > rect.bottom
+            ) {
+              setDropIndicator(null);
+            }
           }
         }}
       >
-        {project.tracks.map(track => (
+        {project.tracks.map((track, index) => (
           <TimelineTrack
             key={track.id}
             track={track}
+            trackIndex={index}
             mediaFiles={project.mediaFiles}
             zoom={zoom}
             scrollX={scrollX}
             trackHeight={trackHeight}
             selectedClipIds={selectedClipIds}
             playhead={playhead}
+            dropIndicator={dropIndicator?.trackId === track.id ? dropIndicator : null}
+            isDragging={draggingTrackIndex === index}
+            isDragOver={dragOverTrackIndex === index}
+            isClipDropTarget={clipTargetTrackId === track.id && draggingClip !== null}
+            onTrackDragStart={() => setDraggingTrackIndex(index)}
+            onTrackDragEnd={() => {
+              if (draggingTrackIndex !== null && dragOverTrackIndex !== null) {
+                onReorderTracks(draggingTrackIndex, dragOverTrackIndex);
+              }
+              setDraggingTrackIndex(null);
+              setDragOverTrackIndex(null);
+            }}
+            onTrackDragOver={() => setDragOverTrackIndex(index)}
             onClipSelect={onClipSelect}
             onClipDragStart={handleClipDragStart}
             onClipResizeStart={(clipId, side) => {

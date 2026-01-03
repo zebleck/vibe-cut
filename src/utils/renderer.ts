@@ -105,46 +105,143 @@ export async function renderProject(
       message: 'Building timeline...',
     });
 
-    // Find the first video file for video track
+    // Collect all clips from all tracks
     const videoTracks = project.tracks.filter(t => t.type === 'video');
     const audioTracks = project.tracks.filter(t => t.type === 'audio');
-    
-    if (project.mediaFiles.length === 0) {
-      throw new Error('No media files to render');
+
+    // Gather all video clips with their media files, sorted by start time
+    const allVideoClips: Array<{
+      clip: typeof videoTracks[0]['clips'][0];
+      mediaFile: typeof project.mediaFiles[0];
+      trackIndex: number;
+    }> = [];
+
+    videoTracks.forEach((track, trackIndex) => {
+      track.clips.forEach(clip => {
+        const mediaFile = project.mediaFiles.find(m => m.id === clip.mediaId);
+        if (mediaFile) {
+          allVideoClips.push({ clip, mediaFile, trackIndex });
+        }
+      });
+    });
+
+    // Sort by start time, then by track index (lower track index = higher priority)
+    allVideoClips.sort((a, b) => {
+      if (a.clip.startTime !== b.clip.startTime) {
+        return a.clip.startTime - b.clip.startTime;
+      }
+      return a.trackIndex - b.trackIndex;
+    });
+
+    // Gather all audio clips
+    const allAudioClips: Array<{
+      clip: typeof audioTracks[0]['clips'][0];
+      mediaFile: typeof project.mediaFiles[0];
+      trackIndex: number;
+    }> = [];
+
+    audioTracks.forEach((track, trackIndex) => {
+      track.clips.forEach(clip => {
+        const mediaFile = project.mediaFiles.find(m => m.id === clip.mediaId);
+        if (mediaFile) {
+          allAudioClips.push({ clip, mediaFile, trackIndex });
+        }
+      });
+    });
+
+    allAudioClips.sort((a, b) => a.clip.startTime - b.clip.startTime);
+
+    if (allVideoClips.length === 0 && allAudioClips.length === 0) {
+      throw new Error('No clips to render');
     }
 
-    // Find video input file
-    let videoInputFile: typeof project.mediaFiles[0] | null = null;
-    let videoInputIndex = -1;
-    
-    if (videoTracks.length > 0 && videoTracks[0].clips.length > 0) {
-      const firstVideoClip = videoTracks[0].clips[0];
-      videoInputFile = project.mediaFiles.find(m => m.id === firstVideoClip.mediaId);
-      if (videoInputFile) {
-        videoInputIndex = project.mediaFiles.indexOf(videoInputFile);
+    onProgress?.({
+      stage: 'encoding',
+      progress: 30,
+      message: 'Building filter graph...',
+    });
+
+    // Build FFmpeg command with complex filter for proper clip handling
+    const outputFormat = settings.format === 'mp4' ? 'mp4' : 'webm';
+    const videoCodec = settings.format === 'mp4' ? 'libx264' : 'libvpx-vp9';
+    const audioCodec = 'aac';
+    const outputFileName = `output.${outputFormat}`;
+
+    const args: string[] = [];
+    const inputMap = new Map<string, number>(); // mediaFile.id -> input index
+    let inputIndex = 0;
+
+    // Add unique media files as inputs
+    const usedMediaIds = new Set<string>();
+    [...allVideoClips, ...allAudioClips].forEach(({ mediaFile }) => {
+      if (!usedMediaIds.has(mediaFile.id)) {
+        usedMediaIds.add(mediaFile.id);
+        const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        args.push('-i', safeName);
+        inputMap.set(mediaFile.id, inputIndex);
+        inputIndex++;
       }
-    }
-    
-    // If no video, use first file
-    if (!videoInputFile) {
-      videoInputFile = project.mediaFiles[0];
-      videoInputIndex = 0;
+    });
+
+    // Build complex filter graph
+    const filterParts: string[] = [];
+    const videoOutputs: string[] = [];
+    const audioOutputs: string[] = [];
+
+    // Process video clips
+    allVideoClips.forEach((item, idx) => {
+      const inputIdx = inputMap.get(item.mediaFile.id)!;
+      const clipDuration = getClipDuration(item.clip, item.mediaFile);
+      const trimStart = item.clip.trimStart;
+      const trimEnd = trimStart + clipDuration;
+
+      // Trim and scale video
+      filterParts.push(
+        `[${inputIdx}:v]trim=start=${trimStart}:end=${trimEnd},setpts=PTS-STARTPTS,` +
+        `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
+        `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,` +
+        `tpad=start_duration=${item.clip.startTime}:start_mode=clone[v${idx}]`
+      );
+      videoOutputs.push(`[v${idx}]`);
+    });
+
+    // Process audio clips
+    allAudioClips.forEach((item, idx) => {
+      const inputIdx = inputMap.get(item.mediaFile.id)!;
+      const clipDuration = getClipDuration(item.clip, item.mediaFile);
+      const trimStart = item.clip.trimStart;
+      const trimEnd = trimStart + clipDuration;
+
+      // Trim audio and add delay for timeline position
+      filterParts.push(
+        `[${inputIdx}:a]atrim=start=${trimStart}:end=${trimEnd},asetpts=PTS-STARTPTS,` +
+        `adelay=${Math.round(item.clip.startTime * 1000)}|${Math.round(item.clip.startTime * 1000)}[a${idx}]`
+      );
+      audioOutputs.push(`[a${idx}]`);
+    });
+
+    // Concatenate or overlay videos
+    if (videoOutputs.length > 0) {
+      if (videoOutputs.length === 1) {
+        filterParts.push(`${videoOutputs[0]}null[vout]`);
+      } else {
+        // Overlay videos (later clips overlay earlier ones)
+        let currentOutput = videoOutputs[0];
+        for (let i = 1; i < videoOutputs.length; i++) {
+          const nextOutput = i === videoOutputs.length - 1 ? '[vout]' : `[vtmp${i}]`;
+          filterParts.push(`${currentOutput}${videoOutputs[i]}overlay=eof_action=pass${nextOutput}`);
+          currentOutput = nextOutput;
+        }
+      }
     }
 
-    // Find audio input file
-    let audioInputFile: typeof project.mediaFiles[0] | null = null;
-    let audioInputIndex = -1;
-    
-    if (audioTracks.length > 0 && audioTracks[0].clips.length > 0) {
-      const firstAudioClip = audioTracks[0].clips[0];
-      audioInputFile = project.mediaFiles.find(m => m.id === firstAudioClip.mediaId);
-      if (audioInputFile) {
-        audioInputIndex = project.mediaFiles.indexOf(audioInputFile);
+    // Mix audio tracks
+    if (audioOutputs.length > 0) {
+      if (audioOutputs.length === 1) {
+        filterParts.push(`${audioOutputs[0]}anull[aout]`);
+      } else {
+        filterParts.push(`${audioOutputs.join('')}amix=inputs=${audioOutputs.length}:duration=longest[aout]`);
       }
-    } else if (videoInputFile && videoInputFile.type === 'video') {
-      // Use audio from video file if no separate audio track
-      audioInputFile = videoInputFile;
-      audioInputIndex = videoInputIndex;
     }
 
     onProgress?.({
@@ -153,57 +250,36 @@ export async function renderProject(
       message: 'Encoding video...',
     });
 
-    // Build FFmpeg command
-    const outputFormat = settings.format === 'mp4' ? 'mp4' : 'webm';
-    const videoCodec = settings.format === 'mp4' ? 'libx264' : 'libvpx-vp9';
-    const audioCodec = 'aac';
-    
-    const videoInputName = videoInputFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const outputFileName = `output.${outputFormat}`;
+    // Add filter complex
+    if (filterParts.length > 0) {
+      args.push('-filter_complex', filterParts.join(';'));
+    }
 
-    // Build FFmpeg arguments
-    const args: string[] = [];
-    
-    // Add video input
-    args.push('-i', videoInputName);
-    
-    // Add audio input if different from video
-    let hasSeparateAudio = false;
-    if (audioInputFile && audioInputIndex !== videoInputIndex) {
-      const audioInputName = audioInputFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-      args.push('-i', audioInputName);
-      hasSeparateAudio = true;
+    // Map outputs
+    if (videoOutputs.length > 0) {
+      args.push('-map', '[vout]');
     }
-    
-    // Video encoding options
-    args.push(
-      '-c:v', videoCodec,
-      '-b:v', `${settings.bitrate}k`,
-      '-r', settings.framerate.toString(),
-      '-s', `${settings.width}x${settings.height}`,
-      '-map', '0:v' // Map video from first input
-    );
-    
-    // Audio encoding options
-    if (audioInputFile) {
-      if (audioInputIndex === videoInputIndex) {
-        // Audio is from the same file as video
-        args.push(
-          '-c:a', audioCodec,
-          '-b:a', '128k',
-          '-map', '0:a?' // Map audio from first input (optional if no audio stream)
-        );
-      } else {
-        // Audio is from a separate file
-        args.push(
-          '-c:a', audioCodec,
-          '-b:a', '128k',
-          '-map', '1:a?' // Map audio from second input (optional)
-        );
-      }
+    if (audioOutputs.length > 0) {
+      args.push('-map', '[aout]');
     }
-    
-    args.push('-shortest'); // Finish encoding when shortest stream ends
+
+    // Encoding options
+    if (videoOutputs.length > 0) {
+      args.push(
+        '-c:v', videoCodec,
+        '-b:v', `${settings.bitrate}k`,
+        '-r', settings.framerate.toString()
+      );
+    }
+
+    if (audioOutputs.length > 0) {
+      args.push(
+        '-c:a', audioCodec,
+        '-b:a', '128k'
+      );
+    }
+
+    args.push('-t', project.duration.toString()); // Limit to project duration
     args.push('-y'); // Overwrite output file
     args.push(outputFileName);
 

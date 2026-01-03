@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { MediaImporter } from './components/MediaImporter';
 import { MediaBin } from './components/MediaBin';
 import { Timeline } from './components/Timeline';
@@ -34,8 +34,10 @@ function App() {
     project,
     addMediaFile,
     addTrack,
+    reorderTracks,
     addClipToTrack,
     updateClip,
+    moveClipToTrack,
     deleteClip,
     deleteClips,
     closeGaps,
@@ -53,14 +55,46 @@ function App() {
   const [playhead, setPlayhead] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [zoom, setZoom] = useState(50);
-  const [scrollX, setScrollX] = useState(0);
+  const [scrollX, setScrollXState] = useState(0);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+
+  // Wrapper to enforce scroll bounds (never go below 0)
+  const setScrollX = useCallback((value: number) => {
+    setScrollXState(Math.max(0, value));
+  }, []);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [snapThreshold] = useState(10);
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState<any>(null);
   const [activeTab, setActiveTab] = useState<'media' | 'effects' | 'transitions'>('media');
   const [draggedMedia, setDraggedMedia] = useState<MediaFile | null>(null);
+  const [previewHeight, setPreviewHeight] = useState(450);
+  const [isResizingPreview, setIsResizingPreview] = useState(false);
+  const mainContentRef = useRef<HTMLDivElement>(null);
+
+  // Handle preview resize
+  useEffect(() => {
+    if (!isResizingPreview) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (mainContentRef.current) {
+        const rect = mainContentRef.current.getBoundingClientRect();
+        const newHeight = e.clientY - rect.top;
+        setPreviewHeight(Math.max(200, Math.min(rect.height - 150, newHeight)));
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsResizingPreview(false);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isResizingPreview]);
 
   // Playback loop with frame-accurate timing
   useEffect(() => {
@@ -425,16 +459,10 @@ function App() {
               onRemoveTransition={removeTransition}
             />
           )}
-
-          <RenderPanel
-            onRender={handleRender}
-            isRendering={isRendering}
-            progress={renderProgress}
-          />
         </div>
 
-        <div className="main-content">
-          <div className="preview-section">
+        <div className="main-content" ref={mainContentRef}>
+          <div className="preview-section" style={{ height: previewHeight }}>
             <VideoPreview project={project} currentTime={playhead} isPlaying={isPlaying} />
             <PlaybackControls
               isPlaying={isPlaying}
@@ -455,6 +483,11 @@ function App() {
             />
           </div>
 
+          <div
+            className={`resize-handle-horizontal ${isResizingPreview ? 'active' : ''}`}
+            onMouseDown={() => setIsResizingPreview(true)}
+          />
+
           <Timeline
             project={project}
             playhead={playhead}
@@ -472,11 +505,15 @@ function App() {
             onZoomChange={setZoom}
             onScrollChange={setScrollX}
             onAddTrack={addTrack}
+            onReorderTracks={reorderTracks}
+            onMoveClipToTrack={moveClipToTrack}
             draggedMedia={draggedMedia}
             onAddClipToTrack={addClipToTrack}
           />
 
           <div className="timeline-actions">
+            <button onClick={() => addTrack('video')}>+ Video Track</button>
+            <button onClick={() => addTrack('audio')}>+ Audio Track</button>
             <button onClick={handleRippleDelete} disabled={selectedClipIds.length === 0}>
               Ripple Delete
             </button>
@@ -499,6 +536,14 @@ function App() {
               Snap
             </label>
           </div>
+        </div>
+
+        <div className="sidebar-right">
+          <RenderPanel
+            onRender={handleRender}
+            isRendering={isRendering}
+            progress={renderProgress}
+          />
         </div>
       </div>
     </div>
