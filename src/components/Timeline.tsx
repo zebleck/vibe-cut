@@ -47,27 +47,76 @@ export function Timeline({
   onAddClipToTrack,
 }: TimelineProps) {
   const timelineRef = useRef<HTMLDivElement>(null);
+  const snapTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [draggingClip, setDraggingClip] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState(0);
-  const [resizingClip, setResizingClip] = useState<{ clipId: string; side: 'left' | 'right' } | null>(null);
+  const [resizingClip, setResizingClip] = useState<{
+    clipId: string;
+    side: 'left' | 'right';
+    initialStartTime: number;
+    initialTrimStart: number;
+    initialTrimEnd: number;
+    initialEndTime: number;
+  } | null>(null);
   const [snapIndicator, setSnapIndicator] = useState<number | null>(null);
 
+  // Track label width offset (matches CSS .track-label width)
+  const TRACK_LABEL_WIDTH = 120;
+
+  // Cleanup snap timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (snapTimeoutRef.current) {
+        clearTimeout(snapTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Handle wheel events with { passive: false } to prevent browser zoom
+  useEffect(() => {
+    const element = timelineRef.current;
+    if (!element) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+        // Zoom with wheel
+        const delta = e.deltaY > 0 ? -5 : 5;
+        const newZoom = Math.max(1, Math.min(500, zoom + delta));
+        onZoomChange(newZoom);
+      } else {
+        // Scroll horizontally
+        onScrollChange(Math.max(0, scrollX + e.deltaY));
+      }
+    };
+
+    element.addEventListener('wheel', handleWheel, { passive: false });
+    return () => element.removeEventListener('wheel', handleWheel);
+  }, [zoom, scrollX, onZoomChange, onScrollChange]);
+
   const handleTimelineClick = (e: MouseEvent<HTMLDivElement>) => {
-    if (timelineRef.current && !draggingClip && !resizingClip && e.target === timelineRef.current) {
+    // Only set playhead when clicking on empty space (track background), not on clips
+    const target = e.target as HTMLElement;
+    const isClickOnClip = target.closest('.timeline-clip') !== null;
+
+    if (timelineRef.current && !draggingClip && !resizingClip && !isClickOnClip) {
       const rect = timelineRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left + scrollX;
+      const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
       let time = pixelsToTime(x, zoom);
-      
+
       if (snapEnabled) {
         const snapPoints = findSnapPoints(project.tracks, playhead);
         const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
         time = snapped.time;
         if (snapped.snapped) {
           setSnapIndicator(time);
-          setTimeout(() => setSnapIndicator(null), 200);
+          if (snapTimeoutRef.current) clearTimeout(snapTimeoutRef.current);
+          snapTimeoutRef.current = setTimeout(() => setSnapIndicator(null), 200);
         }
       }
-      
+
       onPlayheadChange(Math.max(0, time));
     }
   };
@@ -79,8 +128,10 @@ export function Timeline({
     if (rect) {
       const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === clipId);
       if (clip) {
-        const clipX = timeToPixels(clip.startTime, zoom) - scrollX;
-        setDragOffset(e.clientX - rect.left - clipX);
+        // Mouse position relative to track content area (accounting for track label)
+        const mouseX = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+        const clipX = timeToPixels(clip.startTime, zoom);
+        setDragOffset(mouseX - clipX);
       }
     }
   };
@@ -88,9 +139,11 @@ export function Timeline({
   const handleMouseMove = (e: MouseEvent) => {
     if (draggingClip && timelineRef.current) {
       const rect = timelineRef.current.getBoundingClientRect();
-      const x = e.clientX - rect.left - dragOffset + scrollX;
+      // Mouse position relative to track content area
+      const mouseX = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+      const x = mouseX - dragOffset;
       let newStartTime = Math.max(0, pixelsToTime(x, zoom));
-      
+
       if (snapEnabled) {
         const snapPoints = findSnapPoints(project.tracks, playhead, draggingClip);
         const snapped = snapTime(newStartTime, snapPoints, snapThreshold, zoom);
@@ -101,40 +154,53 @@ export function Timeline({
           setSnapIndicator(null);
         }
       }
-      
+
       onClipUpdate(draggingClip, { startTime: newStartTime });
     } else if (resizingClip && timelineRef.current) {
-      const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
-      if (clip) {
-        const mediaFile = project.mediaFiles.find(m => m.id === clip.mediaId);
-        if (mediaFile) {
-          const rect = timelineRef.current.getBoundingClientRect();
-          const x = e.clientX - rect.left + scrollX;
-          let time = pixelsToTime(x, zoom);
-          
-          if (snapEnabled) {
-            const snapPoints = findSnapPoints(project.tracks, playhead, resizingClip.clipId);
-            const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
-            time = snapped.time;
-            if (snapped.snapped) {
-              setSnapIndicator(time);
-            } else {
-              setSnapIndicator(null);
-            }
-          }
-          
-          if (resizingClip.side === 'left') {
-            const trimStart = Math.max(0, time - clip.startTime);
-            const maxTrim = mediaFile.duration - clip.trimEnd;
-            const finalTrimStart = Math.min(trimStart, maxTrim);
-            onClipUpdate(resizingClip.clipId, { trimStart: finalTrimStart });
+      const mediaFile = project.mediaFiles.find(m => {
+        const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
+        return clip && m.id === clip.mediaId;
+      });
+      if (mediaFile) {
+        const rect = timelineRef.current.getBoundingClientRect();
+        // Mouse position relative to track content area
+        const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+        let time = pixelsToTime(x, zoom);
+
+        if (snapEnabled) {
+          const snapPoints = findSnapPoints(project.tracks, playhead, resizingClip.clipId);
+          const snapped = snapTime(time, snapPoints, snapThreshold, zoom);
+          time = snapped.time;
+          if (snapped.snapped) {
+            setSnapIndicator(time);
           } else {
-            const clipEnd = getClipEndTime(clip, mediaFile);
-            const trimEnd = Math.max(0, clipEnd - time);
-            const maxTrim = mediaFile.duration - clip.trimStart;
-            const finalTrimEnd = Math.min(trimEnd, maxTrim);
-            onClipUpdate(resizingClip.clipId, { trimEnd: finalTrimEnd });
+            setSnapIndicator(null);
           }
+        }
+
+        const { initialStartTime, initialTrimStart, initialTrimEnd, initialEndTime } = resizingClip;
+
+        if (resizingClip.side === 'left') {
+          // Left resize: move left edge, keep right edge fixed
+          // Clamp time to valid range
+          const minTime = initialStartTime - initialTrimStart; // Can't go before media start
+          const maxTime = initialEndTime - 0.01; // Can't go past right edge
+          const clampedTime = Math.max(minTime, Math.min(maxTime, time));
+
+          const newStartTime = clampedTime;
+          const newTrimStart = initialTrimStart + (clampedTime - initialStartTime);
+
+          onClipUpdate(resizingClip.clipId, { startTime: newStartTime, trimStart: newTrimStart });
+        } else {
+          // Right resize: move right edge, keep left edge fixed
+          // Clamp time to valid range
+          const minTime = initialStartTime + 0.01; // Can't go before left edge
+          const maxTime = initialStartTime + mediaFile.duration - initialTrimStart; // Can't extend past media end
+          const clampedTime = Math.max(minTime, Math.min(maxTime, time));
+
+          const newTrimEnd = mediaFile.duration - initialTrimStart - (clampedTime - initialStartTime);
+
+          onClipUpdate(resizingClip.clipId, { trimEnd: Math.max(0, newTrimEnd) });
         }
       }
     }
@@ -173,9 +239,6 @@ export function Timeline({
     markers.push(i);
   }
 
-  const videoTracks = project.tracks.filter(t => t.type === 'video');
-  const audioTracks = project.tracks.filter(t => t.type === 'audio');
-
   return (
     <div
       className="timeline-container"
@@ -183,12 +246,22 @@ export function Timeline({
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
     >
-      <div className="timeline-ruler" style={{ height: rulerHeight }}>
+      <div
+        className="timeline-ruler"
+        style={{ height: rulerHeight }}
+        onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
+          const time = Math.max(0, pixelsToTime(x, zoom));
+          onPlayheadChange(time);
+        }}
+      >
         <div
           className="ruler-content"
           style={{
-            width: timelineWidth,
+            width: timelineWidth + TRACK_LABEL_WIDTH,
             transform: `translateX(-${scrollX}px)`,
+            marginLeft: TRACK_LABEL_WIDTH,
           }}
         >
           {markers.map(time => (
@@ -206,14 +279,14 @@ export function Timeline({
         <div
           className="playhead-line"
           style={{
-            left: timeToPixels(playhead, zoom) - scrollX,
+            left: TRACK_LABEL_WIDTH + timeToPixels(playhead, zoom) - scrollX,
           }}
         />
         {snapIndicator !== null && (
           <div
             className="snap-indicator"
             style={{
-              left: timeToPixels(snapIndicator, zoom) - scrollX,
+              left: TRACK_LABEL_WIDTH + timeToPixels(snapIndicator, zoom) - scrollX,
             }}
           />
         )}
@@ -227,7 +300,7 @@ export function Timeline({
             e.preventDefault();
             const rect = timelineRef.current?.getBoundingClientRect();
             if (rect) {
-              const x = e.clientX - rect.left + scrollX;
+              const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
               let time = pixelsToTime(x, zoom);
               if (snapEnabled) {
                 const snapPoints = findSnapPoints(project.tracks, playhead);
@@ -236,7 +309,7 @@ export function Timeline({
               }
               const track = project.tracks.find(t => t.type === draggedMedia.type);
               if (track && onAddClipToTrack) {
-                onAddClipToTrack(track.id, draggedMedia.id, time);
+                onAddClipToTrack(track.id, draggedMedia.id, Math.max(0, time));
               }
             }
           }
@@ -247,68 +320,38 @@ export function Timeline({
             e.dataTransfer.dropEffect = 'copy';
           }
         }}
-        onWheel={(e) => {
-          e.preventDefault();
-          if (e.shiftKey || e.ctrlKey || e.metaKey) {
-            // Zoom with wheel
-            const delta = e.deltaY > 0 ? -5 : 5;
-            const newZoom = Math.max(1, Math.min(500, zoom + delta));
-            onZoomChange(newZoom);
-          } else {
-            // Scroll horizontally
-            const delta = e.deltaY;
-            onScrollChange(Math.max(0, scrollX + delta));
-          }
-        }}
       >
-        <div className="tracks-section">
-          <div className="tracks-header">
-            <h4>Video Tracks</h4>
-            <button onClick={() => onAddTrack('video')}>+ Add Video Track</button>
-          </div>
-          {videoTracks.map(track => (
-            <TimelineTrack
-              key={track.id}
-              track={track}
-              mediaFiles={project.mediaFiles}
-              zoom={zoom}
-              scrollX={scrollX}
-              trackHeight={trackHeight}
-              selectedClipIds={selectedClipIds}
-              playhead={playhead}
-              onClipSelect={onClipSelect}
-              onClipDragStart={handleClipDragStart}
-              onClipResizeStart={(clipId, side) => setResizingClip({ clipId, side })}
-              onClipDelete={onClipDelete}
-              onClipDuplicate={onClipDuplicate}
-              onClipSplit={onClipSplit}
-            />
-          ))}
-        </div>
-        <div className="tracks-section">
-          <div className="tracks-header">
-            <h4>Audio Tracks</h4>
-            <button onClick={() => onAddTrack('audio')}>+ Add Audio Track</button>
-          </div>
-          {audioTracks.map(track => (
-            <TimelineTrack
-              key={track.id}
-              track={track}
-              mediaFiles={project.mediaFiles}
-              zoom={zoom}
-              scrollX={scrollX}
-              trackHeight={trackHeight}
-              selectedClipIds={selectedClipIds}
-              playhead={playhead}
-              onClipSelect={onClipSelect}
-              onClipDragStart={handleClipDragStart}
-              onClipResizeStart={(clipId, side) => setResizingClip({ clipId, side })}
-              onClipDelete={onClipDelete}
-              onClipDuplicate={onClipDuplicate}
-              onClipSplit={onClipSplit}
-            />
-          ))}
-        </div>
+        {project.tracks.map(track => (
+          <TimelineTrack
+            key={track.id}
+            track={track}
+            mediaFiles={project.mediaFiles}
+            zoom={zoom}
+            scrollX={scrollX}
+            trackHeight={trackHeight}
+            selectedClipIds={selectedClipIds}
+            playhead={playhead}
+            onClipSelect={onClipSelect}
+            onClipDragStart={handleClipDragStart}
+            onClipResizeStart={(clipId, side) => {
+              const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === clipId);
+              const mediaFile = clip ? project.mediaFiles.find(m => m.id === clip.mediaId) : null;
+              if (clip && mediaFile) {
+                setResizingClip({
+                  clipId,
+                  side,
+                  initialStartTime: clip.startTime,
+                  initialTrimStart: clip.trimStart,
+                  initialTrimEnd: clip.trimEnd,
+                  initialEndTime: getClipEndTime(clip, mediaFile),
+                });
+              }
+            }}
+            onClipDelete={onClipDelete}
+            onClipDuplicate={onClipDuplicate}
+            onClipSplit={onClipSplit}
+          />
+        ))}
       </div>
       <div className="timeline-controls">
         <div className="control-group">

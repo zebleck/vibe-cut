@@ -13,9 +13,21 @@ import { useUndoRedo } from './hooks/useUndoRedo';
 import { getClipEndTime } from './utils/timelineUtils';
 import { matchShortcut, defaultShortcuts } from './utils/shortcuts';
 import { renderProject } from './utils/renderer';
-import { RenderSettings, Clip, MediaFile } from './types';
+import { RenderSettings, Clip, MediaFile, Project } from './types';
 import { listProjects, loadProject as loadFromIndexedDB } from './utils/indexedDB';
 import './App.css';
+
+function isValidProject(data: unknown): data is Project {
+  if (!data || typeof data !== 'object') return false;
+  const p = data as Record<string, unknown>;
+  return (
+    typeof p.id === 'string' &&
+    typeof p.name === 'string' &&
+    Array.isArray(p.mediaFiles) &&
+    Array.isArray(p.tracks) &&
+    typeof p.duration === 'number'
+  );
+}
 
 function App() {
   const {
@@ -331,10 +343,13 @@ function App() {
         reader.onload = (e) => {
           try {
             const projectData = JSON.parse(e.target?.result as string);
+            if (!isValidProject(projectData)) {
+              throw new Error('Invalid project file structure');
+            }
             loadProject(projectData);
           } catch (error) {
             console.error('Error loading project:', error);
-            alert('Failed to load project file');
+            alert('Failed to load project file: ' + (error instanceof Error ? error.message : 'Unknown error'));
           }
         };
         reader.readAsText(file);

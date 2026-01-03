@@ -22,15 +22,17 @@ export function findClipAtTime(track: Track, time: number, mediaFiles: MediaFile
 
 export function getTrackDuration(track: Track, mediaFiles: MediaFile[]): number {
   if (track.clips.length === 0) return 0;
-  return Math.max(...track.clips.map(clip => {
+  const durations = track.clips.map(clip => {
     const mediaFile = mediaFiles.find(m => m.id === clip.mediaId);
     if (!mediaFile) return 0;
     return getClipEndTime(clip, mediaFile);
-  }));
+  });
+  return durations.length > 0 ? Math.max(...durations) : 0;
 }
 
 export function getProjectDuration(tracks: Track[], mediaFiles: MediaFile[]): number {
   if (tracks.length === 0) return 0;
-  return Math.max(...tracks.map(track => getTrackDuration(track, mediaFiles)));
+  const trackDurations = tracks.map(track => getTrackDuration(track, mediaFiles));
+  return trackDurations.length > 0 ? Math.max(...trackDurations) : 0;
 }
 

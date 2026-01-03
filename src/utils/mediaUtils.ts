@@ -5,11 +5,9 @@ import { loadAudioBuffer, generateWaveform } from './waveformUtils';
 export async function createMediaFile(file: File): Promise<MediaFile> {
   const url = URL.createObjectURL(file);
   const type: MediaType = file.type.startsWith('video/') ? 'video' : 'audio';
-  
-  // Create a temporary URL for metadata extraction
-  const tempUrl = URL.createObjectURL(file);
-  const metadata = await getMediaMetadata(tempUrl, type);
-  URL.revokeObjectURL(tempUrl);
+
+  // Use the same URL for metadata extraction (no need for a separate temp URL)
+  const metadata = await getMediaMetadata(url, type);
   
   const mediaFile: MediaFile = {
     id: crypto.randomUUID(),

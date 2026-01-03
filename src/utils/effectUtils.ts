@@ -1,4 +1,4 @@
-import { Effect, Keyframe } from '../types';
+import { Effect, EffectType } from '../types';
 import { interpolateKeyframes } from './keyframeUtils';
 
 export function applyEffect(effect: Effect, time: number): number {

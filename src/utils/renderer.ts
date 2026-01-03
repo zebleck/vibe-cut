@@ -4,64 +4,60 @@ import { Project, RenderSettings, RenderProgress } from '../types';
 import { getClipDuration, getClipEndTime } from './timelineUtils';
 
 let ffmpegInstance: FFmpeg | null = null;
-let isInitializing = false;
+let initPromise: Promise<FFmpeg> | null = null;
 
 export async function initFFmpeg(): Promise<FFmpeg> {
   if (ffmpegInstance) return ffmpegInstance;
-  if (isInitializing) {
-    // Wait for initialization to complete
-    while (isInitializing) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+
+  // If initialization is in progress, wait for it
+  if (initPromise) return initPromise;
+
+  // Start initialization and store the promise so concurrent calls wait on it
+  initPromise = (async () => {
+    try {
+      const ffmpeg = new FFmpeg();
+
+      // Use the latest stable version from unpkg CDN
+      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+
+      // Set up logging
+      ffmpeg.on('log', ({ message }) => {
+        console.log('FFmpeg log:', message);
+      });
+
+      // Load FFmpeg with proper URLs
+      await ffmpeg.load({
+        coreURL: await toBlobURL(
+          `${baseURL}/ffmpeg-core.js`,
+          'text/javascript'
+        ),
+        wasmURL: await toBlobURL(
+          `${baseURL}/ffmpeg-core.wasm`,
+          'application/wasm'
+        ),
+      });
+
+      ffmpegInstance = ffmpeg;
+      console.log('FFmpeg initialized successfully');
+      return ffmpeg;
+    } catch (error) {
+      // Clear the promise so next call can retry
+      initPromise = null;
+      console.error('Failed to initialize FFmpeg:', error);
+
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to initialize FFmpeg: ${errorMsg}\n\n` +
+        `Possible solutions:\n` +
+        `1. Check your internet connection (ffmpeg.wasm needs to download ~20MB)\n` +
+        `2. Try refreshing the page\n` +
+        `3. Check browser console for CORS or network errors\n` +
+        `4. Make sure you're using a modern browser with WebAssembly support`
+      );
     }
-    if (ffmpegInstance) return ffmpegInstance;
-  }
+  })();
 
-  isInitializing = true;
-  
-  try {
-    const ffmpeg = new FFmpeg();
-    
-    // Use the latest stable version from unpkg CDN
-    // Try using the publicPath approach which works better with Vite
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    
-    // Set up logging
-    ffmpeg.on('log', ({ message }) => {
-      console.log('FFmpeg log:', message);
-    });
-
-    // Load FFmpeg with proper URLs
-    // Using the ESM version which works better with modern bundlers
-    await ffmpeg.load({
-      coreURL: await toBlobURL(
-        `${baseURL}/ffmpeg-core.js`,
-        'text/javascript'
-      ),
-      wasmURL: await toBlobURL(
-        `${baseURL}/ffmpeg-core.wasm`,
-        'application/wasm'
-      ),
-    });
-
-    ffmpegInstance = ffmpeg;
-    isInitializing = false;
-    console.log('FFmpeg initialized successfully');
-    return ffmpeg;
-  } catch (error) {
-    isInitializing = false;
-    console.error('Failed to initialize FFmpeg:', error);
-    
-    // Provide helpful error message
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Failed to initialize FFmpeg: ${errorMsg}\n\n` +
-      `Possible solutions:\n` +
-      `1. Check your internet connection (ffmpeg.wasm needs to download ~20MB)\n` +
-      `2. Try refreshing the page\n` +
-      `3. Check browser console for CORS or network errors\n` +
-      `4. Make sure you're using a modern browser with WebAssembly support`
-    );
-  }
+  return initPromise;
 }
 
 export async function renderProject(
