@@ -1,7 +1,8 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { Project, RenderSettings, RenderProgress } from '../types';
-import { getClipDuration, getClipEndTime } from './timelineUtils';
+import { getClipDuration } from './timelineUtils';
+import { isWebCodecsSupported, renderWithWebCodecs } from './webcodecs-renderer';
 
 let ffmpegInstance: FFmpeg | null = null;
 let initPromise: Promise<FFmpeg> | null = null;
@@ -65,6 +66,16 @@ export async function renderProject(
   settings: RenderSettings,
   onProgress?: (progress: RenderProgress) => void
 ): Promise<Blob> {
+  // Try GPU-accelerated WebCodecs first, fall back to FFmpeg
+  if (isWebCodecsSupported()) {
+    try {
+      console.log('Using GPU-accelerated WebCodecs renderer');
+      return await renderWithWebCodecs(project, settings, onProgress);
+    } catch (error) {
+      console.warn('WebCodecs render failed, falling back to FFmpeg:', error);
+    }
+  }
+
   try {
     onProgress?.({
       stage: 'preparing',
@@ -80,22 +91,36 @@ export async function renderProject(
       message: 'Loading media files...',
     });
 
-    // Write input files
-    for (let i = 0; i < project.mediaFiles.length; i++) {
-      const mediaFile = project.mediaFiles[i];
-      try {
-        const fileData = await fetchFile(mediaFile.url);
-        // Use a safe filename (remove special characters)
-        const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        await ffmpeg.writeFile(safeName, fileData);
+    // Write input files in parallel
+    const fileLoadPromises = project.mediaFiles.map(async (mediaFile) => {
+      const fileData = await fetchFile(mediaFile.url);
+      const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      return { safeName, fileData, name: mediaFile.name };
+    });
+
+    let loaded = 0;
+    const fileResults = await Promise.all(
+      fileLoadPromises.map(p => p.then(result => {
+        loaded++;
         onProgress?.({
           stage: 'preparing',
-          progress: 10 + (i + 1) / project.mediaFiles.length * 10,
-          message: `Loading ${mediaFile.name}...`,
+          progress: 10 + (loaded / project.mediaFiles.length) * 10,
+          message: `Loading ${result.name}...`,
         });
+        return result;
+      }).catch(error => {
+        console.error(`Failed to load media file:`, error);
+        throw error;
+      }))
+    );
+
+    // Write fetched files to FFmpeg filesystem
+    for (const { safeName, fileData, name } of fileResults) {
+      try {
+        await ffmpeg.writeFile(safeName, fileData);
       } catch (error) {
-        console.error(`Failed to load ${mediaFile.name}:`, error);
-        throw new Error(`Failed to load media file: ${mediaFile.name}`);
+        console.error(`Failed to write ${name}:`, error);
+        throw new Error(`Failed to load media file: ${name}`);
       }
     }
 
@@ -104,6 +129,9 @@ export async function renderProject(
       progress: 20,
       message: 'Building timeline...',
     });
+
+    // Build media file lookup map for O(1) access
+    const mediaMap = new Map(project.mediaFiles.map(m => [m.id, m]));
 
     // Collect all clips from all tracks
     const videoTracks = project.tracks.filter(t => t.type === 'video');
@@ -118,7 +146,7 @@ export async function renderProject(
 
     videoTracks.forEach((track, trackIndex) => {
       track.clips.forEach(clip => {
-        const mediaFile = project.mediaFiles.find(m => m.id === clip.mediaId);
+        const mediaFile = mediaMap.get(clip.mediaId);
         if (mediaFile) {
           allVideoClips.push({ clip, mediaFile, trackIndex });
         }
@@ -142,7 +170,7 @@ export async function renderProject(
 
     audioTracks.forEach((track, trackIndex) => {
       track.clips.forEach(clip => {
-        const mediaFile = project.mediaFiles.find(m => m.id === clip.mediaId);
+        const mediaFile = mediaMap.get(clip.mediaId);
         if (mediaFile) {
           allAudioClips.push({ clip, mediaFile, trackIndex });
         }
@@ -270,6 +298,20 @@ export async function renderProject(
         '-b:v', `${settings.bitrate}k`,
         '-r', settings.framerate.toString()
       );
+
+      // Speed-optimized encoding settings
+      if (videoCodec === 'libx264') {
+        args.push(
+          '-preset', 'ultrafast',
+          '-tune', 'fastdecode',
+          '-movflags', '+faststart'
+        );
+      } else if (videoCodec === 'libvpx-vp9') {
+        args.push(
+          '-speed', '4',
+          '-row-mt', '1'
+        );
+      }
     }
 
     if (audioOutputs.length > 0) {
@@ -307,13 +349,14 @@ export async function renderProject(
     const data = await ffmpeg.readFile(outputFileName);
     const blob = new Blob([data], { type: `video/${outputFormat}` });
 
-    // Clean up
+    // Clean up all files in parallel
     try {
-      await ffmpeg.deleteFile(outputFileName);
-      for (const mediaFile of project.mediaFiles) {
-        const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        await ffmpeg.deleteFile(safeName);
-      }
+      await Promise.all([
+        ffmpeg.deleteFile(outputFileName),
+        ...project.mediaFiles.map(mf =>
+          ffmpeg.deleteFile(mf.name.replace(/[^a-zA-Z0-9._-]/g, '_'))
+        )
+      ]);
     } catch (error) {
       console.warn('Failed to clean up files:', error);
     }
