@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Project } from '../types';
+import { useEffect, useRef, useState, useMemo } from 'react';
+import { Project, Clip, MediaFile } from '../types';
 import { findClipAtTime } from '../utils/timelineUtils';
 
 interface VideoPreviewProps {
@@ -8,101 +8,142 @@ interface VideoPreviewProps {
   isPlaying: boolean;
 }
 
+// During playback, only seek if drift exceeds this (avoids fighting the native decoder)
+const DRIFT_THRESHOLD = 0.3;
+// When scrubbing (paused), seek more precisely
+const SCRUB_THRESHOLD = 0.05;
+
 export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [hasVideoAtTime, setHasVideoAtTime] = useState(false);
   const currentMediaIdRef = useRef<string | null>(null);
+  const currentAudioIdRef = useRef<string | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
+  const wasPlayingRef = useRef(false);
 
-  useEffect(() => {
-    const videoTracks = project.tracks.filter(t => t.type === 'video');
-    const audioTracks = project.tracks.filter(t => t.type === 'audio');
+  // Pre-build a media lookup map to avoid .find() on every frame
+  const mediaMap = useMemo(() => {
+    const map = new Map<string, MediaFile>();
+    for (const mf of project.mediaFiles) {
+      map.set(mf.id, mf);
+    }
+    return map;
+  }, [project.mediaFiles]);
 
-    // Find clips at current time - search all tracks (first track with a clip wins)
-    let videoClip = null;
+  // Memoize track lists
+  const videoTracks = useMemo(
+    () => project.tracks.filter(t => t.type === 'video'),
+    [project.tracks]
+  );
+  const audioTracks = useMemo(
+    () => project.tracks.filter(t => t.type === 'audio'),
+    [project.tracks]
+  );
+
+  // Find the current video clip and compute the clip-local time
+  const videoClipInfo = useMemo(() => {
     for (const track of videoTracks) {
       const clip = findClipAtTime(track, currentTime, project.mediaFiles);
       if (clip) {
-        videoClip = clip;
-        break;
+        const mediaFile = mediaMap.get(clip.mediaId);
+        if (mediaFile) {
+          const clipTime = currentTime - clip.startTime + clip.trimStart;
+          return { clip, mediaFile, clipTime };
+        }
       }
     }
+    return null;
+  }, [videoTracks, currentTime, project.mediaFiles, mediaMap]);
 
-    let audioClip = null;
+  const audioClipInfo = useMemo(() => {
     for (const track of audioTracks) {
       const clip = findClipAtTime(track, currentTime, project.mediaFiles);
       if (clip) {
-        audioClip = clip;
-        break;
+        const mediaFile = mediaMap.get(clip.mediaId);
+        if (mediaFile && mediaFile.type === 'audio') {
+          const clipTime = currentTime - clip.startTime + clip.trimStart;
+          return { clip, mediaFile, clipTime };
+        }
       }
     }
+    return null;
+  }, [audioTracks, currentTime, project.mediaFiles, mediaMap]);
 
-    // Update video
-    if (videoRef.current && videoClip) {
-      const mediaFile = project.mediaFiles.find(m => m.id === videoClip.mediaId);
-      if (mediaFile) {
-        setHasVideoAtTime(true);
-        const clipTime = currentTime - videoClip.startTime + videoClip.trimStart;
+  // Handle video source changes and seeking
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
 
-        try {
-          // Check if we need to change the source (compare by mediaId, not URL string)
-          if (currentMediaIdRef.current !== mediaFile.id) {
-            currentMediaIdRef.current = mediaFile.id;
-            pendingSeekRef.current = clipTime;
-            videoRef.current.src = mediaFile.url;
-            videoRef.current.load();
-          } else if (videoRef.current.readyState >= 1) {
-            // Only seek if video is ready and time difference is significant
-            if (Math.abs(videoRef.current.currentTime - clipTime) > 0.05) {
-              videoRef.current.currentTime = clipTime;
-            }
-          } else {
-            // Store pending seek for when video loads
-            pendingSeekRef.current = clipTime;
+    if (videoClipInfo) {
+      const { mediaFile, clipTime } = videoClipInfo;
+      setHasVideoAtTime(true);
+
+      try {
+        // Source changed — load new media
+        if (currentMediaIdRef.current !== mediaFile.id) {
+          currentMediaIdRef.current = mediaFile.id;
+          pendingSeekRef.current = clipTime;
+          video.src = mediaFile.url;
+          video.load();
+        } else if (video.readyState >= 1) {
+          const drift = Math.abs(video.currentTime - clipTime);
+          const threshold = isPlaying ? DRIFT_THRESHOLD : SCRUB_THRESHOLD;
+          if (drift > threshold) {
+            video.currentTime = clipTime;
           }
-        } catch (error) {
-          console.warn('Error updating video preview:', error);
+        } else {
+          pendingSeekRef.current = clipTime;
         }
+      } catch (error) {
+        console.warn('Error updating video preview:', error);
       }
     } else {
       setHasVideoAtTime(false);
       currentMediaIdRef.current = null;
       pendingSeekRef.current = null;
-      if (videoRef.current && videoRef.current.src) {
-        videoRef.current.pause();
-        videoRef.current.removeAttribute('src');
-        videoRef.current.load();
+      if (video.src) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
       }
     }
+  }, [videoClipInfo, isPlaying]);
 
-    // Update audio
-    if (audioRef.current && audioClip) {
-      const mediaFile = project.mediaFiles.find(m => m.id === audioClip.mediaId);
-      if (mediaFile && mediaFile.type === 'audio') {
-        try {
-          if (!audioRef.current.src.includes(mediaFile.id)) {
-            audioRef.current.src = mediaFile.url;
-            audioRef.current.load();
+  // Handle audio source changes and seeking
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    if (audioClipInfo) {
+      const { mediaFile, clipTime } = audioClipInfo;
+
+      try {
+        if (currentAudioIdRef.current !== mediaFile.id) {
+          currentAudioIdRef.current = mediaFile.id;
+          audio.src = mediaFile.url;
+          audio.load();
+        } else if (audio.readyState >= 1) {
+          const drift = Math.abs(audio.currentTime - clipTime);
+          const threshold = isPlaying ? DRIFT_THRESHOLD : SCRUB_THRESHOLD;
+          if (drift > threshold) {
+            audio.currentTime = clipTime;
           }
-          const clipTime = currentTime - audioClip.startTime + audioClip.trimStart;
-          if (audioRef.current.readyState >= 1) {
-            if (Math.abs(audioRef.current.currentTime - clipTime) > 0.05) {
-              audioRef.current.currentTime = clipTime;
-            }
-          }
-        } catch (error) {
-          console.warn('Error updating audio preview:', error);
         }
+      } catch (error) {
+        console.warn('Error updating audio preview:', error);
       }
-    } else if (audioRef.current && audioRef.current.src) {
-      audioRef.current.pause();
-      audioRef.current.removeAttribute('src');
-      audioRef.current.load();
+    } else {
+      currentAudioIdRef.current = null;
+      if (audio.src) {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+      }
     }
-  }, [project, currentTime]);
+  }, [audioClipInfo, isPlaying]);
 
-  // Handle pending seek when video loads
+  // Handle pending seek when video metadata loads
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -112,28 +153,43 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
         video.currentTime = pendingSeekRef.current;
         pendingSeekRef.current = null;
       }
+      // If we were playing when the source changed, resume playback
+      if (wasPlayingRef.current) {
+        video.play().catch(console.error);
+      }
     };
 
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
     return () => video.removeEventListener('loadedmetadata', handleLoadedMetadata);
   }, []);
 
+  // Play/pause control
   useEffect(() => {
-    if (videoRef.current) {
-      if (isPlaying) {
-        videoRef.current.play().catch(console.error);
-      } else {
-        videoRef.current.pause();
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    wasPlayingRef.current = isPlaying;
+
+    if (isPlaying) {
+      if (video && videoClipInfo && video.readyState >= 1) {
+        // Sync position before starting playback
+        const drift = Math.abs(video.currentTime - videoClipInfo.clipTime);
+        if (drift > SCRUB_THRESHOLD) {
+          video.currentTime = videoClipInfo.clipTime;
+        }
+        video.play().catch(console.error);
       }
-    }
-    if (audioRef.current) {
-      if (isPlaying) {
-        audioRef.current.play().catch(console.error);
-      } else {
-        audioRef.current.pause();
+      if (audio && audioClipInfo && audio.readyState >= 1) {
+        const drift = Math.abs(audio.currentTime - audioClipInfo.clipTime);
+        if (drift > SCRUB_THRESHOLD) {
+          audio.currentTime = audioClipInfo.clipTime;
+        }
+        audio.play().catch(console.error);
       }
+    } else {
+      video?.pause();
+      audio?.pause();
     }
-  }, [isPlaying]);
+  }, [isPlaying]); // intentionally only depend on isPlaying
 
   return (
     <div className="video-preview">
@@ -143,4 +199,3 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     </div>
   );
 }
-

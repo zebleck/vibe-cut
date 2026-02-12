@@ -51,7 +51,9 @@ export function Timeline({
   onAddClipToTrack,
 }: TimelineProps) {
   const timelineRef = useRef<HTMLDivElement>(null);
+  const scrollbarRef = useRef<HTMLDivElement>(null);
   const snapTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isScrollbarSyncing = useRef(false);
   const [draggingClip, setDraggingClip] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState(0);
   const [resizingClip, setResizingClip] = useState<{
@@ -83,6 +85,30 @@ export function Timeline({
       }
     };
   }, []);
+
+  // Sync scrollbar position when scrollX changes programmatically (wheel, etc.)
+  useEffect(() => {
+    if (scrollbarRef.current && !isScrollbarSyncing.current) {
+      scrollbarRef.current.scrollLeft = scrollX;
+    }
+  }, [scrollX]);
+
+  // Handle native scrollbar scroll events
+  useEffect(() => {
+    const scrollbar = scrollbarRef.current;
+    if (!scrollbar) return;
+
+    const handleScrollbarScroll = () => {
+      isScrollbarSyncing.current = true;
+      onScrollChange(scrollbar.scrollLeft);
+      requestAnimationFrame(() => {
+        isScrollbarSyncing.current = false;
+      });
+    };
+
+    scrollbar.addEventListener('scroll', handleScrollbarScroll);
+    return () => scrollbar.removeEventListener('scroll', handleScrollbarScroll);
+  }, [onScrollChange]);
 
   // Handle wheel events with { passive: false } to prevent browser zoom
   useEffect(() => {
@@ -448,6 +474,15 @@ export function Timeline({
             onClipSplit={onClipSplit}
           />
         ))}
+      </div>
+      <div
+        className="timeline-scrollbar"
+        ref={scrollbarRef}
+      >
+        <div
+          className="timeline-scrollbar-content"
+          style={{ width: timelineWidth + TRACK_LABEL_WIDTH }}
+        />
       </div>
       <div className="timeline-controls">
         <div className="control-group">

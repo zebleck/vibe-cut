@@ -116,6 +116,7 @@ export async function renderWithWebCodecs(
   project: Project,
   settings: RenderSettings,
   onProgress?: (progress: RenderProgress) => void,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   const mediaMap = new Map(project.mediaFiles.map(m => [m.id, m]));
   const videoTracks = project.tracks.filter(t => t.type === 'video');
@@ -265,7 +266,22 @@ export async function renderWithWebCodecs(
     };
 
     cd.decoder = new VideoDecoder({
-      output: (frame) => cd.queue.push(frame),
+      output: (frame) => {
+        // Discard pre-trim frames — only keep frames at or after the trim point.
+        // One-frame tolerance (~35ms at 30fps) for frame boundary alignment.
+        if (frame.timestamp < cd.trimStartUs - 35_000) {
+          frame.close();
+        } else {
+          // Insert in timestamp-sorted order. B-frames may arrive out of
+          // presentation order, and pickFrame relies on sorted indices to
+          // correctly close only earlier-timestamp frames.
+          let insertIdx = cd.queue.length;
+          while (insertIdx > 0 && cd.queue[insertIdx - 1].timestamp > frame.timestamp) {
+            insertIdx--;
+          }
+          cd.queue.splice(insertIdx, 0, frame);
+        }
+      },
       error: (e) => { cd.error = e instanceof Error ? e : new Error(String(e)); },
     });
 
@@ -284,11 +300,13 @@ export async function renderWithWebCodecs(
 
   // Helper: advance a clip decoder until it has a frame at/past targetUs
   async function advanceDecoder(cd: ClipDecoder, targetUs: number) {
-    // Feed samples until past the target
+    // Feed samples past the target. Use generous lookahead so the decoder
+    // can resolve B-frame reference dependencies (B-frames need future
+    // reference frames before they can be decoded and output).
     while (cd.sampleIdx < cd.samples.length) {
       const s = cd.samples[cd.sampleIdx];
-      if (s.timestamp > targetUs + 200_000) break;    // enough ahead
-      if (s.timestamp > cd.trimEndUs + 500_000) break; // past clip end
+      if (s.timestamp > targetUs + 500_000) break;     // 500ms lookahead for B-frames
+      if (s.timestamp > cd.trimEndUs + 1_000_000) break;
 
       cd.decoder.decode(new EncodedVideoChunk({
         type: s.isKey ? 'key' : 'delta',
@@ -298,14 +316,39 @@ export async function renderWithWebCodecs(
       }));
       cd.sampleIdx++;
 
-      // Yield if queue is building up
+      // Yield periodically to let output callbacks fire
       if (cd.decoder.decodeQueueSize > 10) {
         await new Promise(r => setTimeout(r, 0));
       }
     }
-    // One extra yield to let output callbacks fire
-    if (cd.queue.length === 0) {
-      await new Promise(r => setTimeout(r, 0));
+
+    // Wait for the queue to contain a frame near the target.
+    // Don't wait on decodeQueueSize===0 — B-frames keep it >0 indefinitely.
+    // If the queue never reaches the target (codec error, etc.), the bounded
+    // loop prevents a hang and pickFrame uses the best frame available.
+    for (let attempt = 0; attempt < 200; attempt++) {
+      // Check if the latest decoded frame covers our target
+      if (cd.queue.length > 0) {
+        const latest = cd.queue[cd.queue.length - 1].timestamp;
+        if (latest >= targetUs - 100_000) break;
+      }
+
+      // Feed one more sample if the decoder can accept it — this extends
+      // the lookahead for codecs that need extra future references.
+      if (cd.sampleIdx < cd.samples.length && cd.decoder.decodeQueueSize < 10) {
+        const s = cd.samples[cd.sampleIdx];
+        if (s.timestamp <= cd.trimEndUs + 2_000_000) {
+          cd.decoder.decode(new EncodedVideoChunk({
+            type: s.isKey ? 'key' : 'delta',
+            timestamp: s.timestamp,
+            duration: s.duration,
+            data: s.data,
+          }));
+          cd.sampleIdx++;
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 1));
     }
   }
 
@@ -334,72 +377,82 @@ export async function renderWithWebCodecs(
 
   onProgress?.({ stage: 'encoding', progress: 15, message: 'Encoding (GPU accelerated)...' });
 
-  // Main frame loop: decode and encode in lockstep
-  for (let f = 0; f < totalFrames; f++) {
-    const time = f * frameDurationSec;
+  try {
+    // Main frame loop: decode and encode in lockstep
+    for (let f = 0; f < totalFrames; f++) {
+      if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
 
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, settings.width, settings.height);
+      const time = f * frameDurationSec;
 
-    for (const { clip, mediaFile } of videoClips) {
-      const clipDur = getClipDuration(clip, mediaFile);
-      if (time < clip.startTime || time >= clip.startTime + clipDur) continue;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, settings.width, settings.height);
 
-      const clipTime = time - clip.startTime + clip.trimStart;
-      const clipTimeUs = Math.round(clipTime * 1_000_000);
+      for (const { clip, mediaFile } of videoClips) {
+        const clipDur = getClipDuration(clip, mediaFile);
+        if (time < clip.startTime || time >= clip.startTime + clipDur) continue;
 
-      // Fast path: streaming VideoDecoder
-      const cd = clipDecoders.get(clip.id);
-      if (cd) {
-        if (cd.error) throw cd.error;
-        await advanceDecoder(cd, clipTimeUs);
-        const frame = pickFrame(cd, clipTimeUs);
-        if (frame) {
-          const vw = frame.displayWidth, vh = frame.displayHeight;
+        const clipTime = time - clip.startTime + clip.trimStart;
+        const clipTimeUs = Math.round(clipTime * 1_000_000);
+
+        // Fast path: streaming VideoDecoder
+        const cd = clipDecoders.get(clip.id);
+        if (cd) {
+          if (cd.error) throw cd.error;
+          await advanceDecoder(cd, clipTimeUs);
+          const frame = pickFrame(cd, clipTimeUs);
+          if (frame) {
+            const vw = frame.displayWidth, vh = frame.displayHeight;
+            const scale = Math.min(settings.width / vw, settings.height / vh);
+            const dw = vw * scale, dh = vh * scale;
+            ctx.drawImage(frame as any, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
+          }
+          continue;
+        }
+
+        // Slow fallback: video element seeking
+        const video = fallbackVideos.get(mediaFile.id);
+        if (video) {
+          await seekVideo(video, clipTime);
+          const vw = video.videoWidth, vh = video.videoHeight;
           const scale = Math.min(settings.width / vw, settings.height / vh);
           const dw = vw * scale, dh = vh * scale;
-          ctx.drawImage(frame as any, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
+          ctx.drawImage(video, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
         }
-        continue;
       }
 
-      // Slow fallback: video element seeking
-      const video = fallbackVideos.get(mediaFile.id);
-      if (video) {
-        await seekVideo(video, clipTime);
-        const vw = video.videoWidth, vh = video.videoHeight;
-        const scale = Math.min(settings.width / vw, settings.height / vh);
-        const dw = vw * scale, dh = vh * scale;
-        ctx.drawImage(video, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
+      const outFrame = new VideoFrame(canvas, { timestamp: Math.round(f * frameDurationUs) });
+      videoEncoder.encode(outFrame, { keyFrame: f % (settings.framerate * 2) === 0 });
+      outFrame.close();
+
+      while (videoEncoder.encodeQueueSize > 8) {
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      if (f % 30 === 0) {
+        onProgress?.({
+          stage: 'encoding',
+          progress: 15 + (f / totalFrames) * 70,
+          message: `Frame ${f}/${totalFrames} (GPU accelerated)...`,
+        });
       }
     }
 
-    const outFrame = new VideoFrame(canvas, { timestamp: Math.round(f * frameDurationUs) });
-    videoEncoder.encode(outFrame, { keyFrame: f % (settings.framerate * 2) === 0 });
-    outFrame.close();
-
-    while (videoEncoder.encodeQueueSize > 8) {
-      await new Promise(r => setTimeout(r, 0));
+    await videoEncoder.flush();
+    videoEncoder.close();
+  } catch (err) {
+    // Clean up encoder on error/cancel
+    try { videoEncoder.reset(); } catch {}
+    videoEncoder.close();
+    throw err;
+  } finally {
+    // Always clean up decoders and fallback videos
+    for (const cd of clipDecoders.values()) {
+      try { cd.decoder.reset(); } catch {}
+      cd.decoder.close();
+      cd.queue.forEach(f => f.close());
     }
-
-    if (f % 30 === 0) {
-      onProgress?.({
-        stage: 'encoding',
-        progress: 15 + (f / totalFrames) * 70,
-        message: `Frame ${f}/${totalFrames} (GPU accelerated)...`,
-      });
-    }
+    fallbackVideos.forEach(v => { v.src = ''; });
   }
-
-  // Close streaming decoders
-  for (const cd of clipDecoders.values()) {
-    try { await cd.decoder.flush(); } catch {}
-    cd.decoder.close();
-    cd.queue.forEach(f => f.close());
-  }
-
-  await videoEncoder.flush();
-  videoEncoder.close();
 
   // ── Phase 4: Audio ───────────────────────────────────────────────────
   if (hasAudio) {
@@ -410,8 +463,6 @@ export async function renderWithWebCodecs(
   // ── Finalize ─────────────────────────────────────────────────────────
   onProgress?.({ stage: 'finalizing', progress: 95, message: 'Finalizing...' });
   muxer.finalize();
-
-  fallbackVideos.forEach(v => { v.src = ''; });
 
   const mimeType = isMp4 ? 'video/mp4' : 'video/webm';
   onProgress?.({ stage: 'complete', progress: 100, message: 'Render complete! (GPU accelerated)' });

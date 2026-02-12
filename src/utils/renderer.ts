@@ -64,14 +64,16 @@ export async function initFFmpeg(): Promise<FFmpeg> {
 export async function renderProject(
   project: Project,
   settings: RenderSettings,
-  onProgress?: (progress: RenderProgress) => void
+  onProgress?: (progress: RenderProgress) => void,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   // Try GPU-accelerated WebCodecs first, fall back to FFmpeg
   if (isWebCodecsSupported()) {
     try {
       console.log('Using GPU-accelerated WebCodecs renderer');
-      return await renderWithWebCodecs(project, settings, onProgress);
+      return await renderWithWebCodecs(project, settings, onProgress, signal);
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
       console.warn('WebCodecs render failed, falling back to FFmpeg:', error);
     }
   }

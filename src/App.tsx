@@ -66,6 +66,7 @@ function App() {
   const [snapThreshold] = useState(10);
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState<any>(null);
+  const renderAbortRef = useRef<AbortController | null>(null);
   const [activeTab, setActiveTab] = useState<'media' | 'effects' | 'transitions'>('media');
   const [draggedMedia, setDraggedMedia] = useState<MediaFile | null>(null);
   const [previewHeight, setPreviewHeight] = useState(450);
@@ -96,25 +97,38 @@ function App() {
     };
   }, [isResizingPreview]);
 
-  // Playback loop with frame-accurate timing
+  // Playback loop using requestAnimationFrame for smooth timing
   useEffect(() => {
     if (!isPlaying) return;
 
-    const framerate = project.framerate || 30;
-    const frameTime = 1 / framerate;
-    const interval = setInterval(() => {
+    let rafId: number;
+    let lastTimestamp: number | null = null;
+
+    const tick = (timestamp: number) => {
+      if (lastTimestamp === null) {
+        lastTimestamp = timestamp;
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+
+      const delta = (timestamp - lastTimestamp) / 1000;
+      lastTimestamp = timestamp;
+
       setPlayhead(prev => {
-        const newTime = prev + frameTime;
+        const newTime = prev + delta;
         if (newTime >= project.duration) {
           setIsPlaying(false);
           return project.duration;
         }
         return newTime;
       });
-    }, frameTime * 1000);
 
-    return () => clearInterval(interval);
-  }, [isPlaying, project.duration, project.framerate]);
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [isPlaying, project.duration]);
 
   // Enhanced keyboard shortcuts
   useEffect(() => {
@@ -317,6 +331,9 @@ function App() {
       return;
     }
 
+    const abortController = new AbortController();
+    renderAbortRef.current = abortController;
+
     setIsRendering(true);
     setRenderProgress({
       stage: 'preparing',
@@ -327,7 +344,7 @@ function App() {
     try {
       const blob = await renderProject(project, settings, (progress) => {
         setRenderProgress(progress);
-      });
+      }, abortController.signal);
 
       // Download rendered video
       const url = URL.createObjectURL(blob);
@@ -343,6 +360,11 @@ function App() {
       setRenderProgress(null);
       alert('Rendering complete! Video downloaded.');
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        setIsRendering(false);
+        setRenderProgress(null);
+        return;
+      }
       console.error('Rendering error:', error);
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
       alert(`Rendering failed: ${errorMessage}\n\nCheck browser console for details.`);
@@ -352,8 +374,14 @@ function App() {
         progress: 0,
         message: `Error: ${errorMessage}`,
       });
+    } finally {
+      renderAbortRef.current = null;
     }
   }, [project]);
+
+  const handleCancelRender = useCallback(() => {
+    renderAbortRef.current?.abort();
+  }, []);
 
   const handleSave = useCallback(() => {
     const json = exportProject();
@@ -380,7 +408,48 @@ function App() {
             if (!isValidProject(projectData)) {
               throw new Error('Invalid project file structure');
             }
-            loadProject(projectData);
+
+            // Check if media files need re-linking (no File objects in JSON)
+            const needsMedia = projectData.mediaFiles.length > 0 &&
+              !projectData.mediaFiles.some((mf: any) => mf.file instanceof File);
+
+            if (needsMedia) {
+              const mediaNames = projectData.mediaFiles.map((mf: any) => mf.name).join('\n  ');
+              const doRelink = confirm(
+                `This project references ${projectData.mediaFiles.length} media file(s):\n  ${mediaNames}\n\nSelect the original media files to restore preview and playback.`
+              );
+
+              if (doRelink) {
+                const mediaInput = document.createElement('input');
+                mediaInput.type = 'file';
+                mediaInput.multiple = true;
+                mediaInput.accept = 'video/*,audio/*';
+                mediaInput.onchange = (me) => {
+                  const files = (me.target as HTMLInputElement).files;
+                  const relinkedFiles = new Map<string, File>();
+
+                  if (files) {
+                    // Match by filename
+                    for (const f of Array.from(files)) {
+                      for (const mf of projectData.mediaFiles) {
+                        if (mf.name === f.name) {
+                          relinkedFiles.set(mf.id, f);
+                          relinkedFiles.set(mf.name, f);
+                        }
+                      }
+                    }
+                  }
+
+                  loadProject(projectData, relinkedFiles);
+                };
+                mediaInput.click();
+              } else {
+                // Load without media - timeline structure will show but no preview
+                loadProject(projectData);
+              }
+            } else {
+              loadProject(projectData);
+            }
           } catch (error) {
             console.error('Error loading project:', error);
             alert('Failed to load project file: ' + (error instanceof Error ? error.message : 'Unknown error'));
@@ -541,6 +610,7 @@ function App() {
         <div className="sidebar-right">
           <RenderPanel
             onRender={handleRender}
+            onCancel={handleCancelRender}
             isRendering={isRendering}
             progress={renderProgress}
           />

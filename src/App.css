@@ -490,6 +490,36 @@ body {
   background: #4a4a4a;
 }
 
+.timeline-scrollbar {
+  overflow-x: auto;
+  overflow-y: hidden;
+  height: 12px;
+  min-height: 12px;
+  background: #1e1e1e;
+  border-top: 1px solid #3a3a3a;
+}
+
+.timeline-scrollbar::-webkit-scrollbar {
+  height: 10px;
+}
+
+.timeline-scrollbar::-webkit-scrollbar-track {
+  background: #1e1e1e;
+}
+
+.timeline-scrollbar::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 5px;
+}
+
+.timeline-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #777;
+}
+
+.timeline-scrollbar-content {
+  height: 1px;
+}
+
 .timeline-controls {
   display: flex;
   align-items: center;
@@ -710,8 +740,13 @@ body {
   font-size: 0.85rem;
 }
 
+.render-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .render-button {
-  width: 100%;
+  flex: 1;
   padding: 0.75rem;
   background: #4a9eff;
   border: none;
@@ -729,6 +764,21 @@ body {
 .render-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.cancel-render-button {
+  padding: 0.75rem 1rem;
+  background: #e04040;
+  border: none;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.cancel-render-button:hover {
+  background: #f05050;
 }
 
 .render-progress {

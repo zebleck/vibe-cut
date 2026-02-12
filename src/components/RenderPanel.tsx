@@ -3,11 +3,12 @@ import { RenderSettings } from '../types';
 
 interface RenderPanelProps {
   onRender: (settings: RenderSettings) => void;
+  onCancel: () => void;
   isRendering: boolean;
   progress?: any;
 }
 
-export function RenderPanel({ onRender, isRendering, progress }: RenderPanelProps) {
+export function RenderPanel({ onRender, onCancel, isRendering, progress }: RenderPanelProps) {
   const [settings, setSettings] = useState<RenderSettings>({
     width: 1920,
     height: 1080,
@@ -72,9 +73,16 @@ export function RenderPanel({ onRender, isRendering, progress }: RenderPanelProp
           </select>
         </div>
       </div>
-      <button onClick={handleRender} disabled={isRendering} className="render-button">
-        {isRendering ? 'Rendering...' : '🎬 Render Video'}
-      </button>
+      <div className="render-actions">
+        <button onClick={handleRender} disabled={isRendering} className="render-button">
+          {isRendering ? 'Rendering...' : 'Render Video'}
+        </button>
+        {isRendering && (
+          <button onClick={onCancel} className="cancel-render-button">
+            Cancel
+          </button>
+        )}
+      </div>
       {isRendering && progress && (
         <div className="render-progress">
           <div className="progress-bar">

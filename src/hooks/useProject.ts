@@ -437,9 +437,26 @@ export function useProject() {
     }));
   }, []);
 
-  const loadProject = useCallback((projectData: Project) => {
+  const loadProject = useCallback((projectData: Project, relinkedFiles?: Map<string, File>) => {
+    // Recreate blob URLs from stored File objects (blob URLs don't survive page reloads)
+    const mediaFiles = projectData.mediaFiles.map(mf => {
+      // First try relinked files (from JSON import where File objects are lost)
+      if (relinkedFiles) {
+        const file = relinkedFiles.get(mf.id) || relinkedFiles.get(mf.name);
+        if (file) {
+          return { ...mf, file, url: URL.createObjectURL(file) };
+        }
+      }
+      // Then try existing File objects (from IndexedDB where File objects survive)
+      if (mf.file instanceof File) {
+        return { ...mf, url: URL.createObjectURL(mf.file) };
+      }
+      return mf;
+    });
+
     setProject({
       ...projectData,
+      mediaFiles,
       updatedAt: Date.now(),
     });
   }, []);
