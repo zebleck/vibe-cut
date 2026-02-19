@@ -12,6 +12,7 @@ export interface MediaFile {
   framerate?: number; // frames per second for video
   width?: number; // video width
   height?: number; // video height
+  hasAudio?: boolean; // whether a video file contains an audio stream
   waveform?: Float32Array; // audio waveform data
   thumbnail?: string; // base64 thumbnail for video
   folder?: string; // folder/group for media bin

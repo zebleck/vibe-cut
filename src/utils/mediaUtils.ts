@@ -28,6 +28,34 @@ export async function createMediaFile(file: File): Promise<MediaFile> {
     } catch (error) {
       console.warn('Failed to generate thumbnail:', error);
     }
+
+    // Detect whether the video contains an audio stream
+    const videoEl = document.createElement('video');
+    videoEl.preload = 'metadata';
+    videoEl.src = url;
+    await new Promise<void>(resolve => {
+      videoEl.onloadedmetadata = () => resolve();
+      videoEl.onerror = () => resolve();
+    });
+    const audioTracks = (videoEl as any).audioTracks;
+    if (audioTracks !== undefined) {
+      mediaFile.hasAudio = audioTracks.length > 0;
+    } else {
+      // audioTracks API not supported — assume audio is present
+      mediaFile.hasAudio = true;
+    }
+    videoEl.src = '';
+
+    // Generate waveform for video files with audio
+    if (mediaFile.hasAudio) {
+      try {
+        const audioBuffer = await loadAudioBuffer(file);
+        mediaFile.waveform = await generateWaveform(audioBuffer, 200);
+      } catch {
+        // Video has no decodable audio despite audioTracks reporting it
+        mediaFile.hasAudio = false;
+      }
+    }
   }
 
   // Generate waveform for audio

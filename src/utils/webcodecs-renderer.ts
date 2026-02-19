@@ -491,7 +491,12 @@ async function encodeAudio(
       const source = offlineCtx.createBufferSource();
       source.buffer = audioBuf;
       source.connect(offlineCtx.destination);
-      source.start(clip.startTime, clip.trimStart, getClipDuration(clip, mediaFile));
+      // decodeAudioData may include encoder priming/delay samples at the start
+      // (e.g. AAC encoder delay ≈ 21–24 ms). mediaFile.duration is the true
+      // playback duration reported by the browser (priming already excluded),
+      // so any excess in audioBuf.duration is preamble that must be skipped.
+      const preamble = Math.max(0, audioBuf.duration - mediaFile.duration);
+      source.start(clip.startTime, clip.trimStart + preamble, getClipDuration(clip, mediaFile));
     } catch (e) {
       console.warn('Failed to decode audio clip, skipping:', e);
     }

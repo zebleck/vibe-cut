@@ -95,6 +95,89 @@ export function useProject() {
     });
   }, []);
 
+  // Adds a video clip to a video track and simultaneously adds a linked audio clip
+  // (derived from the same file) to the first available audio track.
+  const addVideoWithLinkedAudio = useCallback((videoTrackId: string, mediaId: string, startTime: number) => {
+    setProject(prev => {
+      const videoTrack = prev.tracks.find(t => t.id === videoTrackId);
+      const videoMediaFile = prev.mediaFiles.find(m => m.id === mediaId);
+      if (!videoTrack || !videoMediaFile) return prev;
+
+      const framerate = videoMediaFile.framerate || prev.framerate || 30;
+      const quantizedStart = Math.round(startTime * framerate) / framerate;
+
+      const videoClip: Clip = {
+        id: crypto.randomUUID(),
+        mediaId,
+        startTime: quantizedStart,
+        trimStart: 0,
+        trimEnd: 0,
+        effects: [],
+        opacity: 1,
+        speed: 1,
+        reverse: false,
+      };
+
+      // Create a derived audio MediaFile referencing the same file/url
+      const audioMediaFile: MediaFile = {
+        id: crypto.randomUUID(),
+        name: videoMediaFile.name,
+        type: 'audio',
+        file: videoMediaFile.file,
+        url: videoMediaFile.url,
+        duration: videoMediaFile.duration,
+        waveform: videoMediaFile.waveform,
+      };
+
+      const audioClip: Clip = {
+        id: crypto.randomUUID(),
+        mediaId: audioMediaFile.id,
+        startTime: quantizedStart,
+        trimStart: 0,
+        trimEnd: 0,
+        effects: [],
+        opacity: 1,
+        speed: 1,
+        reverse: false,
+      };
+
+      // Find the first audio track, or insert a new one after all video tracks
+      const existingAudioTrack = prev.tracks.find(t => t.type === 'audio');
+      let updatedTracks: Track[];
+
+      if (existingAudioTrack) {
+        updatedTracks = prev.tracks.map(t => {
+          if (t.id === videoTrackId) return { ...t, clips: [...t.clips, videoClip] };
+          if (t.id === existingAudioTrack.id) return { ...t, clips: [...t.clips, audioClip] };
+          return t;
+        });
+      } else {
+        const newAudioTrack: Track = {
+          id: `track-audio-${Date.now()}`,
+          type: 'audio',
+          clips: [audioClip],
+          volume: 1,
+        };
+        updatedTracks = [
+          ...prev.tracks.map(t =>
+            t.id === videoTrackId ? { ...t, clips: [...t.clips, videoClip] } : t
+          ),
+          newAudioTrack,
+        ];
+      }
+
+      const duration = getProjectDuration(updatedTracks, [...prev.mediaFiles, audioMediaFile]);
+
+      return {
+        ...prev,
+        mediaFiles: [...prev.mediaFiles, audioMediaFile],
+        tracks: updatedTracks,
+        duration,
+        updatedAt: Date.now(),
+      };
+    });
+  }, []);
+
   const addClipToTrack = useCallback((trackId: string, mediaId: string, startTime: number) => {
     setProject(prev => {
       const track = prev.tracks.find(t => t.id === trackId);
@@ -488,6 +571,7 @@ export function useProject() {
     deleteTrack,
     reorderTracks,
     addClipToTrack,
+    addVideoWithLinkedAudio,
     updateClip,
     moveClipToTrack,
     deleteClip,

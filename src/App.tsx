@@ -36,6 +36,7 @@ function App() {
     addTrack,
     reorderTracks,
     addClipToTrack,
+    addVideoWithLinkedAudio,
     updateClip,
     moveClipToTrack,
     deleteClip,
@@ -236,6 +237,17 @@ function App() {
     }
   }, [handleMediaAdded, project, addTrack, addClipToTrack]);
 
+  // Wrapper: adds a clip to a track, automatically linking audio when a video with audio is added to a video track
+  const handleAddClipToTrack = useCallback((trackId: string, mediaId: string, startTime: number) => {
+    const track = project.tracks.find(t => t.id === trackId);
+    const mediaFile = project.mediaFiles.find(m => m.id === mediaId);
+    if (track?.type === 'video' && mediaFile?.hasAudio) {
+      addVideoWithLinkedAudio(trackId, mediaId, startTime);
+    } else {
+      addClipToTrack(trackId, mediaId, startTime);
+    }
+  }, [project, addClipToTrack, addVideoWithLinkedAudio]);
+
   const handleAddToTrack = useCallback((mediaId: string, trackType: 'video' | 'audio') => {
     const track = project.tracks.find(t => t.type === trackType);
     if (!track) {
@@ -252,8 +264,13 @@ function App() {
       }
     }
 
-    addClipToTrack(track.id, mediaId, startTime);
-  }, [project, addTrack, addClipToTrack]);
+    const mediaFile = project.mediaFiles.find(m => m.id === mediaId);
+    if (trackType === 'video' && mediaFile?.hasAudio) {
+      addVideoWithLinkedAudio(track.id, mediaId, startTime);
+    } else {
+      addClipToTrack(track.id, mediaId, startTime);
+    }
+  }, [project, addTrack, addClipToTrack, addVideoWithLinkedAudio]);
 
   const handleClipSelect = useCallback((clipId: string, multi: boolean) => {
     setSelectedClipIds(prev => {
@@ -577,7 +594,7 @@ function App() {
             onReorderTracks={reorderTracks}
             onMoveClipToTrack={moveClipToTrack}
             draggedMedia={draggedMedia}
-            onAddClipToTrack={addClipToTrack}
+            onAddClipToTrack={handleAddClipToTrack}
           />
 
           <div className="timeline-actions">
