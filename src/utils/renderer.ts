@@ -206,21 +206,25 @@ export async function renderProject(
     const inputMap = new Map<string, number>(); // mediaFile.id -> input index
     let inputIndex = 0;
 
-    // Add unique media files as inputs
-    const usedMediaIds = new Set<string>();
+    // Add unique media files as inputs, deduped by URL so linked video/audio
+    // that point to the same file don't get loaded twice.
+    const urlToInputIndex = new Map<string, number>();
     [...allVideoClips, ...allAudioClips].forEach(({ mediaFile }) => {
-      if (!usedMediaIds.has(mediaFile.id)) {
-        usedMediaIds.add(mediaFile.id);
-        const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        args.push('-i', safeName);
-        inputMap.set(mediaFile.id, inputIndex);
-        inputIndex++;
+      const existing = urlToInputIndex.get(mediaFile.url);
+      if (existing !== undefined) {
+        inputMap.set(mediaFile.id, existing);
+        return;
       }
+
+      const safeName = mediaFile.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      args.push('-i', safeName);
+      inputMap.set(mediaFile.id, inputIndex);
+      urlToInputIndex.set(mediaFile.url, inputIndex);
+      inputIndex++;
     });
 
     // Build complex filter graph
     const filterParts: string[] = [];
-    const videoOutputs: string[] = [];
     const audioOutputs: string[] = [];
 
     // Process video clips
@@ -230,14 +234,12 @@ export async function renderProject(
       const trimStart = item.clip.trimStart;
       const trimEnd = trimStart + clipDuration;
 
-      // Trim and scale video
+      // Trim and scale video (timeline placement done via overlay enable windows)
       filterParts.push(
         `[${inputIdx}:v]trim=start=${trimStart}:end=${trimEnd},setpts=PTS-STARTPTS,` +
         `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
-        `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,` +
-        `tpad=start_duration=${item.clip.startTime}:start_mode=clone[v${idx}]`
+        `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2[v${idx}]`
       );
-      videoOutputs.push(`[v${idx}]`);
     });
 
     // Process audio clips
@@ -255,19 +257,21 @@ export async function renderProject(
       audioOutputs.push(`[a${idx}]`);
     });
 
-    // Concatenate or overlay videos
-    if (videoOutputs.length > 0) {
-      if (videoOutputs.length === 1) {
-        filterParts.push(`${videoOutputs[0]}null[vout]`);
-      } else {
-        // Overlay videos (later clips overlay earlier ones)
-        let currentOutput = videoOutputs[0];
-        for (let i = 1; i < videoOutputs.length; i++) {
-          const nextOutput = i === videoOutputs.length - 1 ? '[vout]' : `[vtmp${i}]`;
-          filterParts.push(`${currentOutput}${videoOutputs[i]}overlay=eof_action=pass${nextOutput}`);
-          currentOutput = nextOutput;
-        }
-      }
+    // Compose timeline video on a single base canvas using enable windows.
+    // This avoids per-clip tpad streams that can exhaust memory on long projects.
+    if (allVideoClips.length > 0) {
+      filterParts.push(`color=c=black:s=${settings.width}x${settings.height}:d=${project.duration}[vbase]`);
+      let currentOutput = '[vbase]';
+      allVideoClips.forEach((item, idx) => {
+        const clipDuration = getClipDuration(item.clip, item.mediaFile);
+        const start = item.clip.startTime.toFixed(6);
+        const end = (item.clip.startTime + clipDuration).toFixed(6);
+        const nextOutput = idx === allVideoClips.length - 1 ? '[vout]' : `[vtmp${idx}]`;
+        filterParts.push(
+          `${currentOutput}[v${idx}]overlay=eof_action=pass:enable='between(t,${start},${end})'${nextOutput}`
+        );
+        currentOutput = nextOutput;
+      });
     }
 
     // Mix audio tracks
@@ -291,7 +295,7 @@ export async function renderProject(
     }
 
     // Map outputs
-    if (videoOutputs.length > 0) {
+    if (allVideoClips.length > 0) {
       args.push('-map', '[vout]');
     }
     if (audioOutputs.length > 0) {
@@ -299,7 +303,7 @@ export async function renderProject(
     }
 
     // Encoding options
-    if (videoOutputs.length > 0) {
+    if (allVideoClips.length > 0) {
       args.push(
         '-c:v', videoCodec,
         '-b:v', `${settings.bitrate}k`,
@@ -332,11 +336,7 @@ export async function renderProject(
     args.push('-y'); // Overwrite output file
     args.push(outputFileName);
 
-    ffmpeg.on('log', ({ message }) => {
-      console.log('FFmpeg:', message);
-    });
-
-    ffmpeg.on('progress', ({ progress, time }) => {
+    ffmpeg.on('progress', ({ progress }) => {
       const progressPercent = Math.min(90, 50 + (progress * 0.4));
       onProgress?.({
         stage: 'encoding',

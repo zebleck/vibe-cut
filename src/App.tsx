@@ -600,6 +600,14 @@ function App() {
           <div className="timeline-actions">
             <button onClick={() => addTrack('video')}>+ Video Track</button>
             <button onClick={() => addTrack('audio')}>+ Audio Track</button>
+            <button
+              onClick={() => {
+                selectedClipIds.forEach(id => splitClip(id, playhead));
+              }}
+              disabled={selectedClipIds.length === 0}
+            >
+              Split at Playhead
+            </button>
             <button onClick={handleRippleDelete} disabled={selectedClipIds.length === 0}>
               Ripple Delete
             </button>

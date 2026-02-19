@@ -525,43 +525,78 @@ export function useProject() {
 
   const splitClip = useCallback((clipId: string, splitTime: number) => {
     setProject(prev => {
-      const updatedTracks = prev.tracks.map(track => {
-        const clipIndex = track.clips.findIndex(c => c.id === clipId);
-        if (clipIndex === -1) return track;
+      const timelineFramerate = prev.framerate || 30;
+      const quantizedSplitTime = Math.round(splitTime * timelineFramerate) / timelineFramerate;
+      const updatedTracks = prev.tracks.map(track => ({ ...track, clips: [...track.clips] }));
 
-        const clip = track.clips[clipIndex];
+      const locateClip = (id: string) => {
+        for (let t = 0; t < updatedTracks.length; t++) {
+          const c = updatedTracks[t].clips.findIndex(clip => clip.id === id);
+          if (c !== -1) return { trackIndex: t, clipIndex: c };
+        }
+        return null;
+      };
+
+      const splitOne = (id: string) => {
+        const loc = locateClip(id);
+        if (!loc) return null;
+
+        const track = updatedTracks[loc.trackIndex];
+        const clip = track.clips[loc.clipIndex];
         const mediaFile = prev.mediaFiles.find(m => m.id === clip.mediaId);
-        if (!mediaFile) return track;
-
-        const framerate = mediaFile.framerate || prev.framerate || 30;
-        const quantizedSplitTime = Math.round(splitTime * framerate) / framerate;
+        if (!mediaFile) return null;
 
         const clipDuration = getClipDuration(clip, mediaFile);
         const relativeSplitTime = quantizedSplitTime - clip.startTime;
+        if (relativeSplitTime <= 0 || relativeSplitTime >= clipDuration) return null;
 
-        if (relativeSplitTime <= 0 || relativeSplitTime >= clipDuration) {
-          return track;
-        }
-
+        const secondId = crypto.randomUUID();
         const firstClip: Clip = {
           ...clip,
           trimEnd: clip.trimEnd + (clipDuration - relativeSplitTime),
         };
-
         const secondClip: Clip = {
           ...clip,
-          id: crypto.randomUUID(),
-          linkedClipId: undefined, // avoid linking multiple clips to one counterpart after split
+          id: secondId,
           startTime: quantizedSplitTime,
           trimStart: clip.trimStart + relativeSplitTime,
+          linkedClipId: undefined,
         };
 
-        const newClips = [...track.clips];
-        newClips[clipIndex] = firstClip;
-        newClips.splice(clipIndex + 1, 0, secondClip);
+        track.clips[loc.clipIndex] = firstClip;
+        track.clips.splice(loc.clipIndex + 1, 0, secondClip);
+        return { firstId: clip.id, secondId };
+      };
 
-        return { ...track, clips: newClips };
-      });
+      const primaryLoc = locateClip(clipId);
+      if (!primaryLoc) return prev;
+      const primaryClip = updatedTracks[primaryLoc.trackIndex].clips[primaryLoc.clipIndex];
+      const linkedId = primaryClip.linkedClipId;
+
+      const primarySplit = splitOne(clipId);
+      let linkedSplit: { firstId: string; secondId: string } | null = null;
+      if (linkedId) {
+        linkedSplit = splitOne(linkedId);
+      }
+
+      if (primarySplit && linkedSplit) {
+        for (const track of updatedTracks) {
+          track.clips = track.clips.map(c => {
+            if (c.id === primarySplit.firstId) return { ...c, linkedClipId: linkedSplit!.firstId };
+            if (c.id === primarySplit.secondId) return { ...c, linkedClipId: linkedSplit!.secondId };
+            if (c.id === linkedSplit.firstId) return { ...c, linkedClipId: primarySplit.firstId };
+            if (c.id === linkedSplit.secondId) return { ...c, linkedClipId: primarySplit.secondId };
+            return c;
+          });
+        }
+      } else if (primarySplit) {
+        // Splitting a non-linked clip: second half should remain independent.
+        for (const track of updatedTracks) {
+          track.clips = track.clips.map(c => (
+            c.id === primarySplit.secondId ? { ...c, linkedClipId: undefined } : c
+          ));
+        }
+      }
 
       const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
 
