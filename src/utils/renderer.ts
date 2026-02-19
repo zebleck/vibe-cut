@@ -3,6 +3,7 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { Project, RenderSettings, RenderProgress } from '../types';
 import { getClipDuration } from './timelineUtils';
 import { isWebCodecsSupported, renderWithWebCodecs } from './webcodecs-renderer';
+import { getPythonRendererHealth, renderWithPythonService } from './pythonRenderer';
 
 let ffmpegInstance: FFmpeg | null = null;
 let initPromise: Promise<FFmpeg> | null = null;
@@ -67,15 +68,48 @@ export async function renderProject(
   onProgress?: (progress: RenderProgress) => void,
   signal?: AbortSignal,
 ): Promise<Blob> {
-  // Try GPU-accelerated WebCodecs first, fall back to FFmpeg.
-  // MP4 with audio is kept on FFmpeg for robust A/V sync on trimmed clips.
+  // Engine selection:
+  // - python: local Python service + native FFmpeg
+  // - auto: python -> webcodecs (when safe) -> ffmpeg.wasm
+  // - gpu: force WebCodecs when available
+  // - compatibility: force ffmpeg.wasm
   const hasAudioClips = project.tracks.some(
     t => t.type === 'audio' && t.clips.length > 0,
   );
-  const useWebCodecs = isWebCodecsSupported() && !(settings.format === 'mp4' && hasAudioClips);
+  const requestedEngine = settings.renderEngine ?? 'auto';
+  const webCodecsSupported = isWebCodecsSupported();
+  const canUseWebCodecs = webCodecsSupported && !(settings.format === 'mp4' && hasAudioClips);
+
+  const shouldTryPython = requestedEngine === 'python' || requestedEngine === 'auto';
+  if (shouldTryPython) {
+    const health = await getPythonRendererHealth(signal);
+    if (health) {
+      try {
+        console.log(`Using Python renderer (engine=${requestedEngine})`);
+        return await renderWithPythonService(project, settings, onProgress, signal);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') throw error;
+        if (requestedEngine === 'python') throw error;
+        console.warn('Python render failed, falling back:', error);
+      }
+    } else if (requestedEngine === 'python') {
+      throw new Error(
+        'Python renderer is not running. Start it with:\n' +
+        'python python-renderer/server.py'
+      );
+    }
+  }
+
+  const useWebCodecs =
+    requestedEngine === 'gpu'
+      ? canUseWebCodecs
+      : requestedEngine === 'compatibility' || requestedEngine === 'python'
+        ? false
+        : canUseWebCodecs;
+
   if (useWebCodecs) {
     try {
-      console.log('Using GPU-accelerated WebCodecs renderer');
+      console.log(`Using WebCodecs renderer (engine=${requestedEngine})`);
       return await renderWithWebCodecs(project, settings, onProgress, signal);
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error;
@@ -196,18 +230,19 @@ export async function renderProject(
       message: 'Building filter graph...',
     });
 
-    // Build FFmpeg command with complex filter for proper clip handling
+    // Build FFmpeg command with complex filter for proper clip handling.
+    // Uses concat-based timeline assembly: each clip is trimmed and concatenated
+    // with black/silence gap segments. This avoids the overlay filter bug where
+    // frames are consumed while the overlay is disabled, causing A/V desync.
     const outputFormat = settings.format === 'mp4' ? 'mp4' : 'webm';
     const videoCodec = settings.format === 'mp4' ? 'libx264' : 'libvpx-vp9';
     const audioCodec = 'aac';
     const outputFileName = `output.${outputFormat}`;
 
     const args: string[] = [];
-    const inputMap = new Map<string, number>(); // mediaFile.id -> input index
+    const inputMap = new Map<string, number>();
     let inputIndex = 0;
 
-    // Add unique media files as inputs, deduped by URL so linked video/audio
-    // that point to the same file don't get loaded twice.
     const urlToInputIndex = new Map<string, number>();
     [...allVideoClips, ...allAudioClips].forEach(({ mediaFile }) => {
       const existing = urlToInputIndex.get(mediaFile.url);
@@ -223,64 +258,100 @@ export async function renderProject(
       inputIndex++;
     });
 
-    // Build complex filter graph
     const filterParts: string[] = [];
-    const audioOutputs: string[] = [];
+    const frameDur = 1 / settings.framerate;
+    let segIdx = 0;
 
-    // Process video clips
-    allVideoClips.forEach((item, idx) => {
-      const inputIdx = inputMap.get(item.mediaFile.id)!;
-      const clipDuration = getClipDuration(item.clip, item.mediaFile);
-      const trimStart = item.clip.trimStart;
-      const trimEnd = trimStart + clipDuration;
-
-      // Trim and scale video (timeline placement done via overlay enable windows)
-      filterParts.push(
-        `[${inputIdx}:v]trim=start=${trimStart}:end=${trimEnd},setpts=PTS-STARTPTS,` +
-        `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
-        `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2[v${idx}]`
-      );
-    });
-
-    // Process audio clips
-    allAudioClips.forEach((item, idx) => {
-      const inputIdx = inputMap.get(item.mediaFile.id)!;
-      const clipDuration = getClipDuration(item.clip, item.mediaFile);
-      const trimStart = item.clip.trimStart;
-      const trimEnd = trimStart + clipDuration;
-
-      // Trim audio and add delay for timeline position
-      filterParts.push(
-        `[${inputIdx}:a]atrim=start=${trimStart}:end=${trimEnd},asetpts=PTS-STARTPTS,` +
-        `adelay=${Math.round(item.clip.startTime * 1000)}|${Math.round(item.clip.startTime * 1000)}[a${idx}]`
-      );
-      audioOutputs.push(`[a${idx}]`);
-    });
-
-    // Compose timeline video on a single base canvas using enable windows.
-    // This avoids per-clip tpad streams that can exhaust memory on long projects.
+    // --- VIDEO TIMELINE (concat) ---
+    const videoSegments: string[] = [];
     if (allVideoClips.length > 0) {
-      filterParts.push(`color=c=black:s=${settings.width}x${settings.height}:d=${project.duration}[vbase]`);
-      let currentOutput = '[vbase]';
-      allVideoClips.forEach((item, idx) => {
+      let currentT = 0;
+      for (const item of allVideoClips) {
         const clipDuration = getClipDuration(item.clip, item.mediaFile);
-        const start = item.clip.startTime.toFixed(6);
-        const end = (item.clip.startTime + clipDuration).toFixed(6);
-        const nextOutput = idx === allVideoClips.length - 1 ? '[vout]' : `[vtmp${idx}]`;
+        const clipStart = item.clip.startTime;
+        const trimStart = item.clip.trimStart;
+        const inputIdx = inputMap.get(item.mediaFile.id)!;
+
+        const gap = clipStart - currentT;
+        if (gap > frameDur) {
+          const lbl = `s${segIdx++}`;
+          filterParts.push(
+            `color=c=black:s=${settings.width}x${settings.height}:r=${settings.framerate}:d=${gap.toFixed(6)},` +
+            `format=yuv420p[${lbl}]`
+          );
+          videoSegments.push(`[${lbl}]`);
+        }
+
+        const lbl = `s${segIdx++}`;
         filterParts.push(
-          `${currentOutput}[v${idx}]overlay=eof_action=pass:enable='between(t,${start},${end})'${nextOutput}`
+          `[${inputIdx}:v]trim=start=${trimStart.toFixed(6)}:duration=${clipDuration.toFixed(6)},` +
+          `setpts=PTS-STARTPTS,fps=${settings.framerate},` +
+          `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
+          `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,` +
+          `format=yuv420p,setsar=1[${lbl}]`
         );
-        currentOutput = nextOutput;
-      });
+        videoSegments.push(`[${lbl}]`);
+        currentT = clipStart + clipDuration;
+      }
+
+      const trail = project.duration - currentT;
+      if (trail > frameDur) {
+        const lbl = `s${segIdx++}`;
+        filterParts.push(
+          `color=c=black:s=${settings.width}x${settings.height}:r=${settings.framerate}:d=${trail.toFixed(6)},` +
+          `format=yuv420p[${lbl}]`
+        );
+        videoSegments.push(`[${lbl}]`);
+      }
+
+      filterParts.push(
+        `${videoSegments.join('')}concat=n=${videoSegments.length}:v=1:a=0[vout]`
+      );
     }
 
-    // Mix audio tracks
-    if (audioOutputs.length > 0) {
-      if (audioOutputs.length === 1) {
-        filterParts.push(`${audioOutputs[0]}anull[aout]`);
-      } else {
-        filterParts.push(`${audioOutputs.join('')}amix=inputs=${audioOutputs.length}:duration=longest[aout]`);
+    // --- AUDIO TIMELINE (concat) ---
+    const audioSegments: string[] = [];
+    if (allAudioClips.length > 0) {
+      let currentT = 0;
+      for (const item of allAudioClips) {
+        const clipDuration = getClipDuration(item.clip, item.mediaFile);
+        const clipStart = item.clip.startTime;
+        const trimStart = item.clip.trimStart;
+        const inputIdx = inputMap.get(item.mediaFile.id)!;
+
+        const gap = clipStart - currentT;
+        if (gap > 0.001) {
+          const lbl = `s${segIdx++}`;
+          filterParts.push(
+            `anullsrc=r=48000:cl=stereo:d=${gap.toFixed(6)},` +
+            `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[${lbl}]`
+          );
+          audioSegments.push(`[${lbl}]`);
+        }
+
+        const lbl = `s${segIdx++}`;
+        filterParts.push(
+          `[${inputIdx}:a]atrim=start=${trimStart.toFixed(6)}:duration=${clipDuration.toFixed(6)},` +
+          `asetpts=PTS-STARTPTS,` +
+          `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[${lbl}]`
+        );
+        audioSegments.push(`[${lbl}]`);
+        currentT = clipStart + clipDuration;
       }
+
+      const trail = project.duration - currentT;
+      if (trail > 0.001) {
+        const lbl = `s${segIdx++}`;
+        filterParts.push(
+          `anullsrc=r=48000:cl=stereo:d=${trail.toFixed(6)},` +
+          `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[${lbl}]`
+        );
+        audioSegments.push(`[${lbl}]`);
+      }
+
+      filterParts.push(
+        `${audioSegments.join('')}concat=n=${audioSegments.length}:v=0:a=1[aout]`
+      );
     }
 
     onProgress?.({
@@ -295,15 +366,15 @@ export async function renderProject(
     }
 
     // Map outputs
-    if (allVideoClips.length > 0) {
+    if (videoSegments.length > 0) {
       args.push('-map', '[vout]');
     }
-    if (audioOutputs.length > 0) {
+    if (audioSegments.length > 0) {
       args.push('-map', '[aout]');
     }
 
     // Encoding options
-    if (allVideoClips.length > 0) {
+    if (videoSegments.length > 0) {
       args.push(
         '-c:v', videoCodec,
         '-b:v', `${settings.bitrate}k`,
@@ -325,7 +396,7 @@ export async function renderProject(
       }
     }
 
-    if (audioOutputs.length > 0) {
+    if (audioSegments.length > 0) {
       args.push(
         '-c:a', audioCodec,
         '-b:a', '128k'
@@ -336,12 +407,38 @@ export async function renderProject(
     args.push('-y'); // Overwrite output file
     args.push(outputFileName);
 
+    let bestEncodedSeconds = 0;
+    const parseTimestampSeconds = (stamp: string): number => {
+      const [hh, mm, ss] = stamp.split(':');
+      return Number(hh) * 3600 + Number(mm) * 60 + Number(ss);
+    };
+
+    // Some ffmpeg.wasm runs (especially with filter_complex) don't emit useful
+    // progress events. Parse "time=HH:MM:SS.xx" from log lines as a fallback.
+    ffmpeg.on('log', ({ message }) => {
+      const m = message.match(/time=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/);
+      if (!m) return;
+      const seconds = parseTimestampSeconds(m[1]);
+      if (!Number.isFinite(seconds) || seconds <= bestEncodedSeconds) return;
+      bestEncodedSeconds = seconds;
+
+      const progressRatio = project.duration > 0
+        ? Math.min(1, bestEncodedSeconds / project.duration)
+        : 0;
+      const progressPercent = Math.min(92, 50 + progressRatio * 42);
+      onProgress?.({
+        stage: 'encoding',
+        progress: progressPercent,
+        message: `Encoding video... ${Math.round(progressRatio * 100)}%`,
+      });
+    });
+
     ffmpeg.on('progress', ({ progress }) => {
       const progressPercent = Math.min(90, 50 + (progress * 0.4));
       onProgress?.({
         stage: 'encoding',
         progress: progressPercent,
-        message: `Encoding... ${Math.round(progress * 100)}%`,
+        message: `Encoding video... ${Math.round(progress * 100)}%`,
       });
     });
 
@@ -356,17 +453,21 @@ export async function renderProject(
     const data = await ffmpeg.readFile(outputFileName);
     const blob = new Blob([data], { type: `video/${outputFormat}` });
 
-    // Clean up all files in parallel
-    try {
-      await Promise.all([
-        ffmpeg.deleteFile(outputFileName),
-        ...project.mediaFiles.map(mf =>
-          ffmpeg.deleteFile(mf.name.replace(/[^a-zA-Z0-9._-]/g, '_'))
-        )
-      ]);
-    } catch (error) {
-      console.warn('Failed to clean up files:', error);
-    }
+    // Clean up files in background. In ffmpeg.wasm, aggressive parallel deletes
+    // can occasionally trigger an "Aborted()" even after a successful encode.
+    const cleanupTargets = [
+      outputFileName,
+      ...new Set(project.mediaFiles.map(mf => mf.name.replace(/[^a-zA-Z0-9._-]/g, '_'))),
+    ];
+    void (async () => {
+      for (const file of cleanupTargets) {
+        try {
+          await ffmpeg.deleteFile(file);
+        } catch (error) {
+          console.warn(`Failed to clean up file "${file}":`, error);
+        }
+      }
+    })();
 
     onProgress?.({
       stage: 'complete',

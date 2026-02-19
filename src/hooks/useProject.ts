@@ -528,6 +528,7 @@ export function useProject() {
       const timelineFramerate = prev.framerate || 30;
       const quantizedSplitTime = Math.round(splitTime * timelineFramerate) / timelineFramerate;
       const updatedTracks = prev.tracks.map(track => ({ ...track, clips: [...track.clips] }));
+      const mediaById = new Map(prev.mediaFiles.map(m => [m.id, m]));
 
       const locateClip = (id: string) => {
         for (let t = 0; t < updatedTracks.length; t++) {
@@ -571,12 +572,37 @@ export function useProject() {
       const primaryLoc = locateClip(clipId);
       if (!primaryLoc) return prev;
       const primaryClip = updatedTracks[primaryLoc.trackIndex].clips[primaryLoc.clipIndex];
-      const linkedId = primaryClip.linkedClipId;
+      const primaryTrackType = updatedTracks[primaryLoc.trackIndex].type;
+      const primaryMedia = mediaById.get(primaryClip.mediaId);
+
+      // Backward compatibility: older projects may not have explicit linkedClipId.
+      // Infer likely counterpart on opposite track with same source/timing.
+      const inferredLinkedId = (!primaryClip.linkedClipId && primaryMedia)
+        ? updatedTracks
+            .filter(t => t.type !== primaryTrackType)
+            .flatMap(t => t.clips)
+            .find(c => {
+              const mf = mediaById.get(c.mediaId);
+              if (!mf) return false;
+              return (
+                mf.url === primaryMedia.url &&
+                Math.abs(c.startTime - primaryClip.startTime) < 1e-6 &&
+                Math.abs(c.trimStart - primaryClip.trimStart) < 1e-6 &&
+                Math.abs(c.trimEnd - primaryClip.trimEnd) < 1e-6
+              );
+            })?.id
+        : undefined;
+      const linkedId = primaryClip.linkedClipId ?? inferredLinkedId;
 
       const primarySplit = splitOne(clipId);
       let linkedSplit: { firstId: string; secondId: string } | null = null;
       if (linkedId) {
         linkedSplit = splitOne(linkedId);
+      }
+
+      // Keep linked clips frame-accurate: either both halves split, or none.
+      if (linkedId && (!primarySplit || !linkedSplit)) {
+        return prev;
       }
 
       if (primarySplit && linkedSplit) {
@@ -586,6 +612,15 @@ export function useProject() {
             if (c.id === primarySplit.secondId) return { ...c, linkedClipId: linkedSplit!.secondId };
             if (c.id === linkedSplit.firstId) return { ...c, linkedClipId: primarySplit.firstId };
             if (c.id === linkedSplit.secondId) return { ...c, linkedClipId: primarySplit.secondId };
+            return c;
+          });
+        }
+      } else if (primarySplit && linkedId && inferredLinkedId) {
+        // Persist inferred links for future operations.
+        for (const track of updatedTracks) {
+          track.clips = track.clips.map(c => {
+            if (c.id === primarySplit.firstId) return { ...c, linkedClipId: inferredLinkedId };
+            if (c.id === inferredLinkedId) return { ...c, linkedClipId: primarySplit.firstId };
             return c;
           });
         }

@@ -20,6 +20,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
   const currentMediaIdRef = useRef<string | null>(null);
   const currentAudioIdRef = useRef<string | null>(null);
   const pendingSeekRef = useRef<number | null>(null);
+  const pendingAudioSeekRef = useRef<number | null>(null);
   const wasPlayingRef = useRef(false);
 
   // Pre-build a media lookup map to avoid .find() on every frame
@@ -30,6 +31,15 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     }
     return map;
   }, [project.mediaFiles]);
+  const clipMap = useMemo(() => {
+    const map = new Map<string, Clip>();
+    for (const track of project.tracks) {
+      for (const clip of track.clips) {
+        map.set(clip.id, clip);
+      }
+    }
+    return map;
+  }, [project.tracks]);
 
   // Memoize track lists
   const videoTracks = useMemo(
@@ -57,6 +67,25 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
   }, [videoTracks, currentTime, project.mediaFiles, mediaMap]);
 
   const audioClipInfo = useMemo(() => {
+    // Prefer linked audio for the active video clip to keep preview deterministic.
+    if (videoClipInfo?.clip.linkedClipId) {
+      const linked = clipMap.get(videoClipInfo.clip.linkedClipId);
+      if (linked) {
+        const linkedMedia = mediaMap.get(linked.mediaId);
+        if (linkedMedia && linkedMedia.type === 'audio') {
+          const linkedDuration = Math.max(0, linkedMedia.duration - linked.trimStart - linked.trimEnd);
+          const inLinkedRange =
+            currentTime >= linked.startTime &&
+            currentTime < linked.startTime + linkedDuration;
+          if (inLinkedRange) {
+            const clipTime = currentTime - linked.startTime + linked.trimStart;
+            return { clip: linked, mediaFile: linkedMedia, clipTime };
+          }
+        }
+      }
+    }
+
+    // Fallback: first audio clip covering current time.
     for (const track of audioTracks) {
       const clip = findClipAtTime(track, currentTime, project.mediaFiles);
       if (clip) {
@@ -67,8 +96,9 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
         }
       }
     }
+
     return null;
-  }, [audioTracks, currentTime, project.mediaFiles, mediaMap]);
+  }, [audioTracks, currentTime, project.mediaFiles, mediaMap, videoClipInfo, clipMap]);
 
   // Handle video source changes and seeking
   useEffect(() => {
@@ -121,6 +151,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
       try {
         if (currentAudioIdRef.current !== mediaFile.id) {
           currentAudioIdRef.current = mediaFile.id;
+          pendingAudioSeekRef.current = clipTime;
           audio.src = mediaFile.url;
           audio.load();
         } else if (audio.readyState >= 1) {
@@ -129,12 +160,15 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
           if (drift > threshold) {
             audio.currentTime = clipTime;
           }
+        } else {
+          pendingAudioSeekRef.current = clipTime;
         }
       } catch (error) {
         console.warn('Error updating audio preview:', error);
       }
     } else {
       currentAudioIdRef.current = null;
+      pendingAudioSeekRef.current = null;
       if (audio.src) {
         audio.pause();
         audio.removeAttribute('src');
@@ -161,6 +195,25 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
 
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
     return () => video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+  }, []);
+
+  // Handle pending seek when audio metadata loads
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const handleLoadedMetadata = () => {
+      if (pendingAudioSeekRef.current !== null) {
+        audio.currentTime = pendingAudioSeekRef.current;
+        pendingAudioSeekRef.current = null;
+      }
+      if (wasPlayingRef.current) {
+        audio.play().catch(console.error);
+      }
+    };
+
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata);
+    return () => audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
   }, []);
 
   // Play/pause control

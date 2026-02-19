@@ -68,7 +68,8 @@ async function demuxMP4(url: string): Promise<DemuxedFile> {
           const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
           box.write(stream);
           // Slice to actual written length (skip 8-byte box header), copy to clean buffer
-          description = new Uint8Array(stream.buffer.slice(8, stream.position));
+          const writePos = (stream as unknown as { position: number }).position;
+          description = new Uint8Array(stream.buffer.slice(8, writePos));
         } catch (e) {
           console.warn('Failed to extract codec description, decoding may fail:', e);
         }

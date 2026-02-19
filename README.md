@@ -82,6 +82,17 @@ npm run dev
 
 The application will be available at `http://localhost:5173`
 
+### Optional: Python Renderer (recommended for sync + speed)
+
+Run a local Python service that uses native FFmpeg:
+
+```bash
+python -m pip install -r python-renderer/requirements.txt
+python python-renderer/server.py
+```
+
+Then in the app, set **Render Engine** to `Python + native FFmpeg (recommended)`.
+
 ### Build
 
 ```bash

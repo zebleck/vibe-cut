@@ -15,6 +15,7 @@ export function RenderPanel({ onRender, onCancel, isRendering, progress }: Rende
     bitrate: 5000,
     framerate: 30,
     format: 'mp4',
+    renderEngine: 'python',
   });
 
   const handleRender = () => {
@@ -70,6 +71,23 @@ export function RenderPanel({ onRender, onCancel, isRendering, progress }: Rende
           >
             <option value="mp4">MP4</option>
             <option value="webm">WebM</option>
+          </select>
+        </div>
+        <div className="setting-group">
+          <label>Render Engine:</label>
+          <select
+            value={settings.renderEngine || 'auto'}
+            onChange={(e) =>
+              setSettings({
+                ...settings,
+                renderEngine: e.target.value as 'auto' | 'python' | 'gpu' | 'compatibility',
+              })
+            }
+          >
+            <option value="python">Python + native FFmpeg (recommended)</option>
+            <option value="auto">Auto (fallback chain)</option>
+            <option value="gpu">GPU/WebCodecs (fast)</option>
+            <option value="compatibility">FFmpeg (stable)</option>
           </select>
         </div>
       </div>
