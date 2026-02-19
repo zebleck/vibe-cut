@@ -106,9 +106,13 @@ export function useProject() {
       const framerate = videoMediaFile.framerate || prev.framerate || 30;
       const quantizedStart = Math.round(startTime * framerate) / framerate;
 
+      const videoClipId = crypto.randomUUID();
+      const audioClipId = crypto.randomUUID();
+
       const videoClip: Clip = {
-        id: crypto.randomUUID(),
+        id: videoClipId,
         mediaId,
+        linkedClipId: audioClipId,
         startTime: quantizedStart,
         trimStart: 0,
         trimEnd: 0,
@@ -130,8 +134,9 @@ export function useProject() {
       };
 
       const audioClip: Clip = {
-        id: crypto.randomUUID(),
+        id: audioClipId,
         mediaId: audioMediaFile.id,
+        linkedClipId: videoClipId,
         startTime: quantizedStart,
         trimStart: 0,
         trimEnd: 0,
@@ -222,7 +227,8 @@ export function useProject() {
 
   const updateClip = useCallback((clipId: string, updates: Partial<Clip>) => {
     setProject(prev => {
-      const clip = prev.tracks.flatMap(t => t.clips).find(c => c.id === clipId);
+      const sourceTrack = prev.tracks.find(t => t.clips.some(c => c.id === clipId));
+      const clip = sourceTrack?.clips.find(c => c.id === clipId);
       if (!clip) return prev;
 
       const mediaFile = prev.mediaFiles.find(m => m.id === clip.mediaId);
@@ -241,11 +247,83 @@ export function useProject() {
         quantizedUpdates.trimEnd = Math.round(updates.trimEnd * framerate) / framerate;
       }
 
+      const hasTimingUpdates =
+        quantizedUpdates.startTime !== undefined ||
+        quantizedUpdates.trimStart !== undefined ||
+        quantizedUpdates.trimEnd !== undefined;
+
+      // Backward compatibility: older projects may not have explicit linkedClipId.
+      // Infer a likely counterpart on the opposite track type when timing-matching.
+      const inferredLinkedClipId = !clip.linkedClipId && sourceTrack
+        ? prev.tracks
+            .filter(t => t.type !== sourceTrack.type)
+            .flatMap(t => t.clips)
+            .find(c => {
+              const mf = prev.mediaFiles.find(m => m.id === c.mediaId);
+              if (!mf) return false;
+              return (
+                mf.url === mediaFile.url &&
+                Math.abs(c.startTime - clip.startTime) < 1e-6 &&
+                Math.abs(c.trimStart - clip.trimStart) < 1e-6 &&
+                Math.abs(c.trimEnd - clip.trimEnd) < 1e-6
+              );
+            })?.id
+        : undefined;
+      const linkedClipId = clip.linkedClipId ?? inferredLinkedClipId;
+
+      const linkedTimingUpdates: Partial<Clip> = hasTimingUpdates ? {
+        ...(quantizedUpdates.startTime !== undefined ? { startTime: quantizedUpdates.startTime } : {}),
+        ...(quantizedUpdates.trimStart !== undefined ? { trimStart: quantizedUpdates.trimStart } : {}),
+        ...(quantizedUpdates.trimEnd !== undefined ? { trimEnd: quantizedUpdates.trimEnd } : {}),
+      } : {};
+
+      const mediaById = new Map(prev.mediaFiles.map(m => [m.id, m]));
+      const clampTiming = (targetClip: Clip, incoming: Partial<Clip>): Partial<Clip> => {
+        if (!hasTimingUpdates) return incoming;
+
+        const targetMedia = mediaById.get(targetClip.mediaId);
+        if (!targetMedia) return incoming;
+
+        const targetFps = targetMedia.framerate || prev.framerate || 30;
+        const minDuration = 1 / targetFps;
+
+        const nextStartTime = incoming.startTime ?? targetClip.startTime;
+        let nextTrimStart = incoming.trimStart ?? targetClip.trimStart;
+        let nextTrimEnd = incoming.trimEnd ?? targetClip.trimEnd;
+
+        const maxTrimStart = Math.max(0, targetMedia.duration - nextTrimEnd - minDuration);
+        nextTrimStart = Math.max(0, Math.min(maxTrimStart, nextTrimStart));
+
+        const maxTrimEnd = Math.max(0, targetMedia.duration - nextTrimStart - minDuration);
+        nextTrimEnd = Math.max(0, Math.min(maxTrimEnd, nextTrimEnd));
+
+        return {
+          ...incoming,
+          ...(incoming.startTime !== undefined ? { startTime: Math.max(0, nextStartTime) } : {}),
+          ...(incoming.trimStart !== undefined ? { trimStart: nextTrimStart } : {}),
+          ...(incoming.trimEnd !== undefined ? { trimEnd: nextTrimEnd } : {}),
+        };
+      };
+
       const updatedTracks = prev.tracks.map(track => ({
         ...track,
-        clips: track.clips.map(c =>
-          c.id === clipId ? { ...c, ...quantizedUpdates } : c
-        ),
+        clips: track.clips.map(c => {
+          if (c.id === clipId) {
+            return {
+              ...c,
+              ...(inferredLinkedClipId ? { linkedClipId: inferredLinkedClipId } : {}),
+              ...clampTiming(c, quantizedUpdates),
+            };
+          }
+          if (hasTimingUpdates && linkedClipId && c.id === linkedClipId) {
+            return {
+              ...c,
+              ...(inferredLinkedClipId ? { linkedClipId: clipId } : {}),
+              ...clampTiming(c, linkedTimingUpdates),
+            };
+          }
+          return c;
+        }),
       }));
 
       const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
@@ -424,6 +502,7 @@ export function useProject() {
         const newClip: Clip = {
           ...clip,
           id: crypto.randomUUID(),
+          linkedClipId: undefined, // duplicates are independent by default
           startTime: newStartTime,
         };
 
@@ -472,6 +551,7 @@ export function useProject() {
         const secondClip: Clip = {
           ...clip,
           id: crypto.randomUUID(),
+          linkedClipId: undefined, // avoid linking multiple clips to one counterpart after split
           startTime: quantizedSplitTime,
           trimStart: clip.trimStart + relativeSplitTime,
         };

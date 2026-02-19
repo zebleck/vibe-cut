@@ -67,8 +67,13 @@ export async function renderProject(
   onProgress?: (progress: RenderProgress) => void,
   signal?: AbortSignal,
 ): Promise<Blob> {
-  // Try GPU-accelerated WebCodecs first, fall back to FFmpeg
-  if (isWebCodecsSupported()) {
+  // Try GPU-accelerated WebCodecs first, fall back to FFmpeg.
+  // MP4 with audio is kept on FFmpeg for robust A/V sync on trimmed clips.
+  const hasAudioClips = project.tracks.some(
+    t => t.type === 'audio' && t.clips.length > 0,
+  );
+  const useWebCodecs = isWebCodecsSupported() && !(settings.format === 'mp4' && hasAudioClips);
+  if (useWebCodecs) {
     try {
       console.log('Using GPU-accelerated WebCodecs renderer');
       return await renderWithWebCodecs(project, settings, onProgress, signal);

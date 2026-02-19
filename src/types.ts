@@ -46,6 +46,7 @@ export interface Transition {
 export interface Clip {
   id: string;
   mediaId: string;
+  linkedClipId?: string; // optional paired clip (e.g. video<->derived audio)
   startTime: number; // position on timeline in seconds
   trimStart: number; // trim offset from start in seconds (frame-quantized)
   trimEnd: number; // trim offset from end in seconds (frame-quantized)
