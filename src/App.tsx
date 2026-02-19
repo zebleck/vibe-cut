@@ -147,16 +147,45 @@ function App() {
       switch (shortcut.action) {
         case 'split':
           if (selectedClipIds.length > 0) {
-            selectedClipIds.forEach(id => splitClip(id, playhead));
+            const ids = [...selectedClipIds];
+            const before = structuredClone(project);
+            executeCommand({
+              execute: () => {
+                ids.forEach(id => splitClip(id, playhead));
+              },
+              undo: () => loadProject(before),
+              description: 'Split selected clips',
+            });
           }
           break;
         case 'duplicate':
-          selectedClipIds.forEach(id => duplicateClip(id));
+          if (selectedClipIds.length > 0) {
+            const ids = [...selectedClipIds];
+            const before = structuredClone(project);
+            executeCommand({
+              execute: () => {
+                ids.forEach(id => duplicateClip(id));
+              },
+              undo: () => loadProject(before),
+              description: 'Duplicate selected clips',
+            });
+          }
           break;
         case 'delete':
           if (selectedClipIds.length > 0) {
-            selectedClipIds.forEach(id => deleteClip(id));
-            setSelectedClipIds([]);
+            const ids = [...selectedClipIds];
+            const before = structuredClone(project);
+            executeCommand({
+              execute: () => {
+                ids.forEach(id => deleteClip(id));
+                setSelectedClipIds([]);
+              },
+              undo: () => {
+                loadProject(before);
+                setSelectedClipIds(ids);
+              },
+              description: 'Delete selected clips',
+            });
           }
           break;
         case 'play-pause':
@@ -207,6 +236,9 @@ function App() {
     deleteClip,
     undo,
     redo,
+    project,
+    executeCommand,
+    loadProject,
   ]);
 
   const handleMediaAdded = useCallback(async (file: File) => {
@@ -297,26 +329,87 @@ function App() {
     });
   }, [executeCommand, updateClip, project]);
 
-  const handleClipDelete = useCallback((clipId: string) => {
+  const takeProjectSnapshot = useCallback((): Project => {
+    return structuredClone(project);
+  }, [project]);
+
+  const handleClipSplit = useCallback((clipId: string, time: number) => {
+    const before = takeProjectSnapshot();
     executeCommand({
-      execute: () => deleteClip(clipId),
+      execute: () => splitClip(clipId, time),
+      undo: () => loadProject(before),
+      description: 'Split clip',
+    });
+  }, [executeCommand, splitClip, loadProject, takeProjectSnapshot]);
+
+  const handleClipDuplicate = useCallback((clipId: string) => {
+    const before = takeProjectSnapshot();
+    executeCommand({
+      execute: () => duplicateClip(clipId),
+      undo: () => loadProject(before),
+      description: 'Duplicate clip',
+    });
+  }, [executeCommand, duplicateClip, loadProject, takeProjectSnapshot]);
+
+  const handleClipDelete = useCallback((clipId: string) => {
+    const before = takeProjectSnapshot();
+    const previousSelection = [...selectedClipIds];
+    executeCommand({
+      execute: () => {
+        deleteClip(clipId);
+        setSelectedClipIds(prev => prev.filter(id => id !== clipId));
+      },
       undo: () => {
-        // Simplified - would need to restore clip
+        loadProject(before);
+        setSelectedClipIds(previousSelection);
       },
       description: 'Delete clip',
     });
-    setSelectedClipIds(prev => prev.filter(id => id !== clipId));
-  }, [executeCommand, deleteClip]);
+  }, [executeCommand, deleteClip, loadProject, selectedClipIds, takeProjectSnapshot]);
+
+  const handleSplitSelected = useCallback(() => {
+    if (selectedClipIds.length === 0) return;
+    const ids = [...selectedClipIds];
+    const before = takeProjectSnapshot();
+    executeCommand({
+      execute: () => {
+        ids.forEach(id => splitClip(id, playhead));
+      },
+      undo: () => loadProject(before),
+      description: 'Split selected clips',
+    });
+  }, [selectedClipIds, takeProjectSnapshot, executeCommand, splitClip, playhead, loadProject]);
+
+  const handleDuplicateSelected = useCallback(() => {
+    if (selectedClipIds.length === 0) return;
+    const ids = [...selectedClipIds];
+    const before = takeProjectSnapshot();
+    executeCommand({
+      execute: () => {
+        ids.forEach(id => duplicateClip(id));
+      },
+      undo: () => loadProject(before),
+      description: 'Duplicate selected clips',
+    });
+  }, [selectedClipIds, takeProjectSnapshot, executeCommand, duplicateClip, loadProject]);
 
   const handleRippleDelete = useCallback(() => {
     if (selectedClipIds.length === 0) return;
+    const ids = [...selectedClipIds];
+    const before = takeProjectSnapshot();
+    const previousSelection = [...selectedClipIds];
     executeCommand({
-      execute: () => deleteClips(selectedClipIds, true),
-      undo: () => {},
+      execute: () => {
+        deleteClips(ids, true);
+        setSelectedClipIds([]);
+      },
+      undo: () => {
+        loadProject(before);
+        setSelectedClipIds(previousSelection);
+      },
       description: 'Ripple delete',
     });
-    setSelectedClipIds([]);
-  }, [selectedClipIds, executeCommand, deleteClips]);
+  }, [selectedClipIds, takeProjectSnapshot, executeCommand, deleteClips, loadProject]);
 
   const handleJumpToCut = useCallback((direction: 'prev' | 'next') => {
     const allCuts: number[] = [];
@@ -585,8 +678,8 @@ function App() {
             onPlayheadChange={setPlayhead}
             onClipUpdate={handleClipUpdate}
             onClipDelete={handleClipDelete}
-            onClipDuplicate={duplicateClip}
-            onClipSplit={splitClip}
+            onClipDuplicate={handleClipDuplicate}
+            onClipSplit={handleClipSplit}
             onClipSelect={handleClipSelect}
             onZoomChange={setZoom}
             onScrollChange={setScrollX}
@@ -600,12 +693,7 @@ function App() {
           <div className="timeline-actions">
             <button onClick={() => addTrack('video')}>+ Video Track</button>
             <button onClick={() => addTrack('audio')}>+ Audio Track</button>
-            <button
-              onClick={() => {
-                selectedClipIds.forEach(id => splitClip(id, playhead));
-              }}
-              disabled={selectedClipIds.length === 0}
-            >
+            <button onClick={handleSplitSelected} disabled={selectedClipIds.length === 0}>
               Split at Playhead
             </button>
             <button onClick={handleRippleDelete} disabled={selectedClipIds.length === 0}>
