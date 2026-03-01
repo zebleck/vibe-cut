@@ -1,7 +1,7 @@
 import { Project, RenderProgress, RenderSettings } from '../types';
 
 const PYTHON_RENDER_URL = 'http://127.0.0.1:8765';
-const REQUIRED_PYTHON_RENDERER_VERSION = '2026-02-27-speed-v2';
+const REQUIRED_PYTHON_RENDERER_VERSION = '2026-03-01-text-v1';
 
 type PythonHealth = {
   status: string;
@@ -62,6 +62,21 @@ export async function renderWithPythonService(
         trimEnd: c.trimEnd,
         speed: c.speed,
         reverse: c.reverse,
+        textOverlay: c.textOverlay
+          ? {
+              content: c.textOverlay.content,
+              duration: c.textOverlay.duration,
+              x: c.textOverlay.x,
+              y: c.textOverlay.y,
+              fontSize: c.textOverlay.fontSize,
+              color: c.textOverlay.color,
+              fontFamily: c.textOverlay.fontFamily,
+              fontWeight: c.textOverlay.fontWeight,
+              fontStyle: c.textOverlay.fontStyle,
+              backgroundColor: c.textOverlay.backgroundColor,
+              align: c.textOverlay.align,
+            }
+          : undefined,
       })),
     })),
     mediaFiles: project.mediaFiles.map(m => ({

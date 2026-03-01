@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 
 app = FastAPI(title="Vibe Python Renderer")
-RENDERER_VERSION = "2026-02-27-speed-v2"
+RENDERER_VERSION = "2026-03-01-text-v1"
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,6 +88,24 @@ def _fmt(v: float) -> str:
     return f"{v:.6f}"
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _escape_drawtext_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("%", "\\%")
+    )
+
+
+def _escape_drawtext_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok", "version": RENDERER_VERSION}
@@ -128,6 +146,24 @@ async def render(request: Request, background_tasks: BackgroundTasks):
 
         video_tracks = [t for t in project["tracks"] if t["type"] == "video"]
         audio_tracks = [t for t in project["tracks"] if t["type"] == "audio"]
+        text_overlays: List[Dict[str, Any]] = []
+
+        for track in video_tracks:
+            for clip in track["clips"]:
+                overlay = clip.get("textOverlay")
+                if not isinstance(overlay, dict):
+                    continue
+                start_time = float(clip.get("startTime", 0.0))
+                duration = max(0.0, float(overlay.get("duration", 0.0)))
+                end_time = start_time + duration
+                if end_time <= start_time:
+                    continue
+                text_overlays.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "overlay": overlay,
+                })
+        text_overlays.sort(key=lambda item: item["start"])
 
         all_video: List[Dict[str, Any]] = []
         for ti, track in enumerate(video_tracks):
@@ -155,7 +191,7 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                     all_audio.append({"clip": clip, "media": media, "trackIndex": ti})
         all_audio.sort(key=lambda x: float(x["clip"]["startTime"]))
 
-        if not all_video and not all_audio:
+        if not all_video and not all_audio and not text_overlays:
             raise HTTPException(status_code=400, detail="No clips to render")
 
         width = int(settings["width"])
@@ -244,6 +280,53 @@ async def render(request: Request, background_tasks: BackgroundTasks):
             filter_parts.append(
                 f"{''.join(video_segments)}concat=n={len(video_segments)}:v=1:a=0[vout]"
             )
+        elif text_overlays:
+            filter_parts.append(
+                f"color=c=black:s={width}x{height}:r={framerate}:d={_fmt(output_duration)},"
+                f"format=yuv420p[vout]"
+            )
+            video_segments.append("[vout]")
+
+        # --- TEXT OVERLAYS ---
+        has_text_filters = False
+        if text_overlays:
+            source_label = "vout"
+            for i, item in enumerate(text_overlays):
+                overlay = item["overlay"]
+                content = _escape_drawtext_text(str(overlay.get("content", "")))
+                if content == "":
+                    continue
+
+                color = _escape_drawtext_value(str(overlay.get("color", "#ffffff")))
+                font_family = _escape_drawtext_value(str(overlay.get("fontFamily", "Arial")))
+                x_norm = _clamp(float(overlay.get("x", 0.5)), 0.0, 1.0)
+                y_norm = _clamp(float(overlay.get("y", 0.85)), 0.0, 1.0)
+                font_size = max(8, int(float(overlay.get("fontSize", 48))))
+                align = str(overlay.get("align", "center")).lower()
+
+                if align == "left":
+                    draw_x = f"w*{x_norm:.4f}"
+                elif align == "right":
+                    draw_x = f"w*{x_norm:.4f}-text_w"
+                else:
+                    draw_x = f"w*{x_norm:.4f}-text_w/2"
+                draw_y = f"h*{y_norm:.4f}-text_h/2"
+
+                start_t = _fmt(float(item["start"]))
+                end_t = _fmt(float(item["end"]))
+                bg_color = overlay.get("backgroundColor")
+                box_opts = ""
+                if isinstance(bg_color, str) and bg_color.strip():
+                    box_opts = f":box=1:boxcolor={_escape_drawtext_value(bg_color.strip())}:boxborderw=8"
+
+                out_label = "vout_text" if i == len(text_overlays) - 1 else f"vtxt{i}"
+                filter_parts.append(
+                    f"[{source_label}]drawtext=text='{content}':fontcolor={color}:fontsize={font_size}:"
+                    f"x={draw_x}:y={draw_y}:font='{font_family}':"
+                    f"enable='between(t,{start_t},{end_t})'{box_opts}[{out_label}]"
+                )
+                source_label = out_label
+                has_text_filters = True
 
         # --- AUDIO TIMELINE ---
         audio_segments: List[str] = []
@@ -303,7 +386,7 @@ async def render(request: Request, background_tasks: BackgroundTasks):
         if filter_parts:
             args.extend(["-filter_complex", ";".join(filter_parts)])
         if video_segments:
-            args.extend(["-map", "[vout]"])
+            args.extend(["-map", "[vout_text]" if has_text_filters else "[vout]"])
         if audio_segments:
             args.extend(["-map", "[aout]"])
 
