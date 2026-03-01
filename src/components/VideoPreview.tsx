@@ -6,6 +6,8 @@ interface VideoPreviewProps {
   project: Project;
   currentTime: number;
   isPlaying: boolean;
+  renderWidth?: number;
+  renderHeight?: number;
 }
 
 // During playback, only seek if drift exceeds this (avoids fighting the native decoder)
@@ -29,7 +31,18 @@ function getPreviewTime(
   return { clipTime, speed };
 }
 
-export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewProps) {
+function clampCrop(value: number): number {
+  return Math.max(0, Math.min(0.45, value));
+}
+
+export function VideoPreview({
+  project,
+  currentTime,
+  isPlaying,
+  renderWidth = 1920,
+  renderHeight = 1080,
+}: VideoPreviewProps) {
+  const previewRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [hasVideoAtTime, setHasVideoAtTime] = useState(false);
@@ -38,6 +51,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
   const pendingSeekRef = useRef<number | null>(null);
   const pendingAudioSeekRef = useRef<number | null>(null);
   const wasPlayingRef = useRef(false);
+  const [outputFrame, setOutputFrame] = useState({ width: 0, height: 0 });
 
   // Pre-build a media lookup map to avoid .find() on every frame
   const mediaMap = useMemo(() => {
@@ -66,6 +80,18 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     () => project.tracks.filter(t => t.type === 'audio'),
     [project.tracks]
   );
+
+  const textOverlaysAtTime = useMemo(() => {
+    return videoTracks.flatMap(track =>
+      track.clips
+        .filter(clip => {
+          if (!clip.textOverlay) return false;
+          const endTime = clip.startTime + clip.textOverlay.duration;
+          return currentTime >= clip.startTime && currentTime < endTime;
+        })
+        .map(clip => clip.textOverlay!)
+    );
+  }, [videoTracks, currentTime]);
 
   // Find the current video clip and compute the clip-local time
   const videoClipInfo = useMemo(() => {
@@ -116,6 +142,50 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
 
     return null;
   }, [audioTracks, currentTime, project.mediaFiles, mediaMap, videoClipInfo, clipMap]);
+
+  const previewVideoStyle = useMemo(() => {
+    if (!videoClipInfo) {
+      return { display: 'none' as const };
+    }
+
+    const transform = videoClipInfo.clip.transform ?? { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+    const crop = videoClipInfo.clip.crop ?? { left: 0, right: 0, top: 0, bottom: 0 };
+    const insetTop = clampCrop(crop.top) * 100;
+    const insetRight = clampCrop(crop.right) * 100;
+    const insetBottom = clampCrop(crop.bottom) * 100;
+    const insetLeft = clampCrop(crop.left) * 100;
+
+    return {
+      display: 'block' as const,
+      clipPath: `inset(${insetTop}% ${insetRight}% ${insetBottom}% ${insetLeft}%)`,
+      transform: `translate(${transform.x}px, ${transform.y}px) rotate(${transform.rotation}deg) scale(${transform.scaleX}, ${transform.scaleY})`,
+      transformOrigin: 'center center',
+    };
+  }, [videoClipInfo]);
+
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element) return;
+
+    const updateFrame = () => {
+      const bounds = element.getBoundingClientRect();
+      const containerW = Math.max(1, bounds.width);
+      const containerH = Math.max(1, bounds.height);
+      const aspect = renderWidth / Math.max(1, renderHeight);
+      let width = containerW;
+      let height = width / aspect;
+      if (height > containerH) {
+        height = containerH;
+        width = height * aspect;
+      }
+      setOutputFrame({ width, height });
+    };
+
+    updateFrame();
+    const observer = new ResizeObserver(updateFrame);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [renderWidth, renderHeight]);
 
   // Handle video source changes and seeking
   useEffect(() => {
@@ -264,10 +334,38 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
   }, [isPlaying]); // intentionally only depend on isPlaying
 
   return (
-    <div className="video-preview">
-      {!hasVideoAtTime && <div className="video-preview-black" />}
-      <video ref={videoRef} muted style={{ display: hasVideoAtTime ? 'block' : 'none' }} />
+    <div className="video-preview" ref={previewRef}>
+      {!hasVideoAtTime && textOverlaysAtTime.length === 0 && <div className="video-preview-black" />}
+      <video ref={videoRef} muted style={hasVideoAtTime ? previewVideoStyle : { display: 'none' }} />
       <audio ref={audioRef} />
+      {outputFrame.width > 0 && outputFrame.height > 0 && (
+        <div
+          className="preview-output-frame"
+          style={{ width: outputFrame.width, height: outputFrame.height }}
+        >
+          <span className="preview-output-label">{renderWidth}x{renderHeight}</span>
+        </div>
+      )}
+      {textOverlaysAtTime.map((overlay, index) => (
+        <div
+          key={`${overlay.content}-${index}`}
+          className="preview-text-overlay"
+          style={{
+            left: `${overlay.x * 100}%`,
+            top: `${overlay.y * 100}%`,
+            fontSize: `${overlay.fontSize}px`,
+            color: overlay.color,
+            fontFamily: overlay.fontFamily,
+            fontWeight: overlay.fontWeight,
+            fontStyle: overlay.fontStyle,
+            backgroundColor: overlay.backgroundColor ?? 'transparent',
+            textAlign: overlay.align,
+            transform: 'translate(-50%, -50%)',
+          }}
+        >
+          {overlay.content}
+        </div>
+      ))}
     </div>
   );
 }

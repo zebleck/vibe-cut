@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { RenderSettings } from '../types';
 
 interface RenderPanelProps {
@@ -6,9 +6,10 @@ interface RenderPanelProps {
   onCancel: () => void;
   isRendering: boolean;
   progress?: any;
+  onSettingsChange?: (settings: RenderSettings) => void;
 }
 
-export function RenderPanel({ onRender, onCancel, isRendering, progress }: RenderPanelProps) {
+export function RenderPanel({ onRender, onCancel, isRendering, progress, onSettingsChange }: RenderPanelProps) {
   const [settings, setSettings] = useState<RenderSettings>({
     width: 1920,
     height: 1080,
@@ -21,6 +22,10 @@ export function RenderPanel({ onRender, onCancel, isRendering, progress }: Rende
   const handleRender = () => {
     onRender(settings);
   };
+
+  useEffect(() => {
+    onSettingsChange?.(settings);
+  }, [settings, onSettingsChange]);
 
   return (
     <div className="render-panel">
@@ -122,4 +127,3 @@ export function RenderPanel({ onRender, onCancel, isRendering, progress }: Rende
     </div>
   );
 }
-

@@ -56,13 +56,34 @@ export interface Clip {
   speed: number; // playback speed multiplier (1.0 = normal, 2.0 = 2x speed)
   reverse: boolean; // reverse playback
   transform?: {
-    x: number; // position x offset
-    y: number; // position y offset
+    x: number; // position x offset in output pixels
+    y: number; // position y offset in output pixels
     scaleX: number; // horizontal scale
     scaleY: number; // vertical scale
     rotation: number; // rotation in degrees
     keyframes?: Keyframe[]; // transform animation keyframes
   };
+  crop?: {
+    left: number; // percentage from left side (0-0.45)
+    right: number; // percentage from right side (0-0.45)
+    top: number; // percentage from top side (0-0.45)
+    bottom: number; // percentage from bottom side (0-0.45)
+  };
+  textOverlay?: TextOverlay;
+}
+
+export interface TextOverlay {
+  content: string;
+  duration: number; // in seconds
+  x: number; // 0-1 normalized horizontal position
+  y: number; // 0-1 normalized vertical position
+  fontSize: number; // in pixels
+  color: string; // css hex/rgb color
+  fontFamily: string;
+  fontWeight: 'normal' | 'bold';
+  fontStyle: 'normal' | 'italic';
+  backgroundColor?: string; // css color, supports alpha
+  align: 'left' | 'center' | 'right';
 }
 
 export interface Track {

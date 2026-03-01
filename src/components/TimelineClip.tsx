@@ -6,7 +6,7 @@ import { getClipDuration } from '../utils/timelineUtils';
 
 interface TimelineClipProps {
   clip: Clip;
-  mediaFile: MediaFile;
+  mediaFile?: MediaFile;
   left: number;
   width: number;
   height: number;
@@ -71,9 +71,11 @@ export function TimelineClip({
     Math.min(menuPos.y, (typeof window !== 'undefined' ? window.innerHeight : menuPos.y) - menuHeight - 8)
   );
 
+  const clipLabel = clip.textOverlay ? 'Text Overlay' : mediaFile?.name ?? 'Unknown';
+
   return (
     <div
-      className={`timeline-clip ${isSelected ? 'selected' : ''}`}
+      className={`timeline-clip ${isSelected ? 'selected' : ''} ${clip.textOverlay ? 'text-clip' : ''}`}
       style={{
         left: `${left}px`,
         width: `${width}px`,
@@ -82,7 +84,7 @@ export function TimelineClip({
       onMouseDown={handleMouseDown}
       onContextMenu={handleContextMenu}
     >
-      {mediaFile.type === 'video' && mediaFile.thumbnail && width > 60 && (
+      {mediaFile?.type === 'video' && mediaFile.thumbnail && width > 60 && !clip.textOverlay && (
         <div
           className="clip-thumbnail"
           style={{
@@ -93,7 +95,7 @@ export function TimelineClip({
         />
       )}
       <div className="clip-content">
-        <span className="clip-name">{mediaFile.name}</span>
+        <span className="clip-name">{clip.textOverlay?.content || clipLabel}</span>
         <span className="clip-duration">{formatTime(clipDuration)}</span>
       </div>
       <div

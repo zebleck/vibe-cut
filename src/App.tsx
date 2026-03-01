@@ -8,13 +8,13 @@ import { RecordingPanel } from './components/RecordingPanel';
 import { RenderPanel } from './components/RenderPanel';
 import { EffectsPanel } from './components/EffectsPanel';
 import { TransitionsPanel } from './components/TransitionsPanel';
+import { TextPanel } from './components/TextPanel';
 import { useProject } from './hooks/useProject';
 import { useUndoRedo } from './hooks/useUndoRedo';
 import { getClipEndTime } from './utils/timelineUtils';
 import { matchShortcut, defaultShortcuts } from './utils/shortcuts';
 import { renderProject } from './utils/renderer';
 import { RenderSettings, Clip, MediaFile, Project } from './types';
-import { listProjects, loadProject as loadFromIndexedDB } from './utils/indexedDB';
 import './App.css';
 
 function isValidProject(data: unknown): data is Project {
@@ -36,6 +36,7 @@ function App() {
     addTrack,
     reorderTracks,
     addClipToTrack,
+    addTextClip,
     addVideoWithLinkedAudio,
     updateClip,
     moveClipToTrack,
@@ -67,8 +68,16 @@ function App() {
   const [snapThreshold] = useState(10);
   const [isRendering, setIsRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState<any>(null);
+  const [previewRenderSettings, setPreviewRenderSettings] = useState<RenderSettings>({
+    width: 1920,
+    height: 1080,
+    bitrate: 5000,
+    framerate: 30,
+    format: 'mp4',
+    renderEngine: 'python',
+  });
   const renderAbortRef = useRef<AbortController | null>(null);
-  const [activeTab, setActiveTab] = useState<'media' | 'effects' | 'transitions'>('media');
+  const [activeTab, setActiveTab] = useState<'media' | 'effects' | 'transitions' | 'text'>('media');
   const [draggedMedia, setDraggedMedia] = useState<MediaFile | null>(null);
   const [previewHeight, setPreviewHeight] = useState(450);
   const [isResizingPreview, setIsResizingPreview] = useState(false);
@@ -136,6 +145,26 @@ function App() {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Don't trigger shortcuts when typing in inputs
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && e.shiftKey && selectedClipIds.length > 0) {
+        e.preventDefault();
+        const framerate = project.framerate || 30;
+        const frameTime = 1 / framerate;
+        const delta = e.key === 'ArrowLeft' ? -frameTime : frameTime;
+        const before = structuredClone(project);
+        executeCommand({
+          execute: () => {
+            selectedClipIds.forEach(id => {
+              const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === id);
+              if (!clip) return;
+              updateClip(id, { startTime: Math.max(0, clip.startTime + delta) });
+            });
+          },
+          undo: () => loadProject(before),
+          description: 'Nudge selected clips',
+        });
         return;
       }
 
@@ -328,6 +357,17 @@ function App() {
       description: 'Update clip',
     });
   }, [executeCommand, updateClip, project]);
+
+  const handleAddText = useCallback(() => {
+    let targetTrack = project.tracks.find(t => t.type === 'video');
+    if (!targetTrack) {
+      addTrack('video');
+      targetTrack = project.tracks.find(t => t.type === 'video');
+    }
+    if (targetTrack) {
+      addTextClip(targetTrack.id, playhead, 'New Text');
+    }
+  }, [project, addTrack, addTextClip, playhead]);
 
   const takeProjectSnapshot = useCallback((): Project => {
     return structuredClone(project);
@@ -608,6 +648,12 @@ function App() {
             >
               Transitions
             </button>
+            <button
+              className={activeTab === 'text' ? 'active' : ''}
+              onClick={() => setActiveTab('text')}
+            >
+              Text
+            </button>
           </div>
 
           {activeTab === 'media' && (
@@ -638,11 +684,24 @@ function App() {
               onRemoveTransition={removeTransition}
             />
           )}
+
+          {activeTab === 'text' && (
+            <TextPanel
+              selectedClips={selectedClips}
+              onUpdateClip={handleClipUpdate}
+            />
+          )}
         </div>
 
         <div className="main-content" ref={mainContentRef}>
           <div className="preview-section" style={{ height: previewHeight }}>
-            <VideoPreview project={project} currentTime={playhead} isPlaying={isPlaying} />
+            <VideoPreview
+              project={project}
+              currentTime={playhead}
+              isPlaying={isPlaying}
+              renderWidth={previewRenderSettings.width}
+              renderHeight={previewRenderSettings.height}
+            />
             <PlaybackControls
               isPlaying={isPlaying}
               currentTime={playhead}
@@ -683,7 +742,6 @@ function App() {
             onClipSelect={handleClipSelect}
             onZoomChange={setZoom}
             onScrollChange={setScrollX}
-            onAddTrack={addTrack}
             onReorderTracks={reorderTracks}
             onMoveClipToTrack={moveClipToTrack}
             draggedMedia={draggedMedia}
@@ -693,6 +751,10 @@ function App() {
           <div className="timeline-actions">
             <button onClick={() => addTrack('video')}>+ Video Track</button>
             <button onClick={() => addTrack('audio')}>+ Audio Track</button>
+            <button onClick={handleAddText}>+ Text Clip</button>
+            <button onClick={handleDuplicateSelected} disabled={selectedClipIds.length === 0}>
+              Duplicate Selected
+            </button>
             <button onClick={handleSplitSelected} disabled={selectedClipIds.length === 0}>
               Split at Playhead
             </button>
@@ -726,6 +788,7 @@ function App() {
             onCancel={handleCancelRender}
             isRendering={isRendering}
             progress={renderProgress}
+            onSettingsChange={setPreviewRenderSettings}
           />
         </div>
       </div>

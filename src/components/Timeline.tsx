@@ -1,7 +1,7 @@
 import { useState, useRef, MouseEvent, useEffect } from 'react';
 import { Project, Clip, MediaFile } from '../types';
 import { timeToPixels, pixelsToTime, formatTime } from '../utils/mediaUtils';
-import { getClipDuration, getClipEndTime } from '../utils/timelineUtils';
+import { getClipEndTime } from '../utils/timelineUtils';
 import { findSnapPoints, snapTime } from '../utils/snappingUtils';
 import { TimelineTrack } from './TimelineTrack';
 
@@ -21,7 +21,6 @@ interface TimelineProps {
   onClipSelect: (clipId: string, multi: boolean) => void;
   onZoomChange: (zoom: number) => void;
   onScrollChange: (scrollX: number) => void;
-  onAddTrack: (type: 'video' | 'audio') => void;
   onReorderTracks: (fromIndex: number, toIndex: number) => void;
   onMoveClipToTrack: (clipId: string, targetTrackId: string, newStartTime?: number) => void;
   draggedMedia?: MediaFile | null;
@@ -44,7 +43,6 @@ export function Timeline({
   onClipSelect,
   onZoomChange,
   onScrollChange,
-  onAddTrack,
   onReorderTracks,
   onMoveClipToTrack,
   draggedMedia,
@@ -63,6 +61,7 @@ export function Timeline({
     initialTrimStart: number;
     initialTrimEnd: number;
     initialEndTime: number;
+    initialTextDuration?: number;
   } | null>(null);
   const [snapIndicator, setSnapIndicator] = useState<number | null>(null);
   const [dropIndicator, setDropIndicator] = useState<{
@@ -201,7 +200,6 @@ export function Timeline({
       // Calculate which track the clip is being dragged over
       const trackIndex = Math.floor(mouseY / trackHeight);
       const targetTrack = project.tracks[trackIndex];
-      const currentClip = project.tracks.flatMap(t => t.clips).find(c => c.id === draggingClip);
       const currentTrack = project.tracks.find(t => t.clips.some(c => c.id === draggingClip));
 
       if (targetTrack && currentTrack && targetTrack.type === currentTrack.type) {
@@ -212,11 +210,9 @@ export function Timeline({
 
       onClipUpdate(draggingClip, { startTime: newStartTime });
     } else if (resizingClip && timelineRef.current) {
-      const mediaFile = project.mediaFiles.find(m => {
-        const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
-        return clip && m.id === clip.mediaId;
-      });
-      if (mediaFile) {
+      const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
+      const mediaFile = clip ? project.mediaFiles.find(m => m.id === clip.mediaId) : null;
+      if (clip && (mediaFile || clip.textOverlay)) {
         const rect = timelineRef.current.getBoundingClientRect();
         // Mouse position relative to track content area
         const x = e.clientX - rect.left - TRACK_LABEL_WIDTH + scrollX;
@@ -233,9 +229,34 @@ export function Timeline({
           }
         }
 
-        const { initialStartTime, initialTrimStart, initialTrimEnd, initialEndTime } = resizingClip;
-        const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
+        const { initialStartTime, initialTrimStart, initialEndTime, initialTextDuration } = resizingClip;
         const speed = clip?.speed && clip.speed > 0 ? clip.speed : 1;
+
+        if (clip.textOverlay && initialTextDuration !== undefined) {
+          if (resizingClip.side === 'left') {
+            const maxTime = initialEndTime - 0.05;
+            const clampedStart = Math.max(0, Math.min(maxTime, time));
+            const nextDuration = Math.max(0.05, initialTextDuration + (initialStartTime - clampedStart));
+            onClipUpdate(resizingClip.clipId, {
+              startTime: clampedStart,
+              textOverlay: {
+                ...clip.textOverlay,
+                duration: nextDuration,
+              },
+            });
+          } else {
+            const nextDuration = Math.max(0.05, time - initialStartTime);
+            onClipUpdate(resizingClip.clipId, {
+              textOverlay: {
+                ...clip.textOverlay,
+                duration: nextDuration,
+              },
+            });
+          }
+          return;
+        }
+
+        if (!mediaFile) return;
 
         if (resizingClip.side === 'left') {
           // Left resize: move left edge, keep right edge fixed
@@ -300,7 +321,6 @@ export function Timeline({
   const trackHeight = 100;
 
   // Generate time markers with frame precision
-  const framerate = project.framerate || 30;
   const markers = [];
   const markerInterval = zoom < 50 ? 10 : zoom < 100 ? 5 : zoom < 200 ? 1 : 0.5;
   for (let i = 0; i <= duration; i += markerInterval) {
@@ -460,14 +480,15 @@ export function Timeline({
             onClipResizeStart={(clipId, side) => {
               const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === clipId);
               const mediaFile = clip ? project.mediaFiles.find(m => m.id === clip.mediaId) : null;
-              if (clip && mediaFile) {
+              if (clip && (mediaFile || clip.textOverlay)) {
                 setResizingClip({
                   clipId,
                   side,
                   initialStartTime: clip.startTime,
                   initialTrimStart: clip.trimStart,
                   initialTrimEnd: clip.trimEnd,
-                  initialEndTime: getClipEndTime(clip, mediaFile),
+                  initialEndTime: getClipEndTime(clip, mediaFile ?? undefined),
+                  initialTextDuration: clip.textOverlay?.duration,
                 });
               }
             }}

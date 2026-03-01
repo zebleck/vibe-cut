@@ -32,6 +32,8 @@ function sliderToSpeed(sliderValue: number): number {
 export function EffectsPanel({ selectedClips, onUpdateClip }: EffectsPanelProps) {
   const clip = selectedClips[0] || null; // Edit first selected clip
   const [activeEffect, setActiveEffect] = useState<Effect | null>(null);
+  const transform = clip?.transform ?? { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+  const crop = clip?.crop ?? { left: 0, right: 0, top: 0, bottom: 0 };
 
   useEffect(() => {
     setActiveEffect(clip?.effects[0] || null);
@@ -79,6 +81,40 @@ export function EffectsPanel({ selectedClips, onUpdateClip }: EffectsPanelProps)
   const handleOpacityChange = (opacity: number) => {
     if (!clip) return;
     onUpdateClip(clip.id, { opacity });
+  };
+
+  const handleTransformChange = (updates: Partial<NonNullable<Clip['transform']>>) => {
+    if (!clip) return;
+    onUpdateClip(clip.id, {
+      transform: {
+        ...transform,
+        ...updates,
+      },
+    });
+  };
+
+  const handleCropChange = (updates: Partial<NonNullable<Clip['crop']>>) => {
+    if (!clip) return;
+    const next = {
+      ...crop,
+      ...updates,
+    };
+    const maxPerSide = 0.45;
+    const clamped = {
+      left: Math.max(0, Math.min(maxPerSide, next.left)),
+      right: Math.max(0, Math.min(maxPerSide, next.right)),
+      top: Math.max(0, Math.min(maxPerSide, next.top)),
+      bottom: Math.max(0, Math.min(maxPerSide, next.bottom)),
+    };
+    onUpdateClip(clip.id, { crop: clamped });
+  };
+
+  const handleResetTransformAndCrop = () => {
+    if (!clip) return;
+    onUpdateClip(clip.id, {
+      transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 },
+      crop: { left: 0, right: 0, top: 0, bottom: 0 },
+    });
   };
 
   if (!clip) {
@@ -154,9 +190,250 @@ export function EffectsPanel({ selectedClips, onUpdateClip }: EffectsPanelProps)
             value={clip.opacity || 1}
             onChange={(e) => handleOpacityChange(parseFloat(e.target.value))}
           />
+          <input
+            type="number"
+            min="0"
+            max="1"
+            step="0.01"
+            value={(clip.opacity || 1).toFixed(2)}
+            onChange={(e) => {
+              const next = parseFloat(e.target.value);
+              if (Number.isFinite(next)) {
+                handleOpacityChange(Math.max(0, Math.min(1, next)));
+              }
+            }}
+          />
           <span>{Math.round((clip.opacity || 1) * 100)}%</span>
         </div>
       </div>
+
+      {!clip.textOverlay && (
+        <div className="effect-section">
+          <h4>Transform</h4>
+          <div className="control-group">
+            <label>X:</label>
+            <input
+              type="range"
+              min="-1000"
+              max="1000"
+              step="1"
+              value={transform.x}
+              onChange={(e) => handleTransformChange({ x: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="-1000"
+              max="1000"
+              step="1"
+              value={Math.round(transform.x)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleTransformChange({ x: next });
+              }}
+            />
+            <span>{Math.round(transform.x)}px</span>
+          </div>
+          <div className="control-group">
+            <label>Y:</label>
+            <input
+              type="range"
+              min="-1000"
+              max="1000"
+              step="1"
+              value={transform.y}
+              onChange={(e) => handleTransformChange({ y: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="-1000"
+              max="1000"
+              step="1"
+              value={Math.round(transform.y)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleTransformChange({ y: next });
+              }}
+            />
+            <span>{Math.round(transform.y)}px</span>
+          </div>
+          <div className="control-group">
+            <label>Scale X:</label>
+            <input
+              type="range"
+              min="0.1"
+              max="4"
+              step="0.01"
+              value={transform.scaleX}
+              onChange={(e) => handleTransformChange({ scaleX: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0.1"
+              max="4"
+              step="0.01"
+              value={transform.scaleX.toFixed(2)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) {
+                  handleTransformChange({ scaleX: Math.max(0.1, Math.min(4, next)) });
+                }
+              }}
+            />
+            <span>{transform.scaleX.toFixed(2)}x</span>
+          </div>
+          <div className="control-group">
+            <label>Scale Y:</label>
+            <input
+              type="range"
+              min="0.1"
+              max="4"
+              step="0.01"
+              value={transform.scaleY}
+              onChange={(e) => handleTransformChange({ scaleY: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0.1"
+              max="4"
+              step="0.01"
+              value={transform.scaleY.toFixed(2)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) {
+                  handleTransformChange({ scaleY: Math.max(0.1, Math.min(4, next)) });
+                }
+              }}
+            />
+            <span>{transform.scaleY.toFixed(2)}x</span>
+          </div>
+          <div className="control-group">
+            <label>Rotation:</label>
+            <input
+              type="range"
+              min="-180"
+              max="180"
+              step="1"
+              value={transform.rotation}
+              onChange={(e) => handleTransformChange({ rotation: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="-180"
+              max="180"
+              step="1"
+              value={Math.round(transform.rotation)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) {
+                  handleTransformChange({ rotation: Math.max(-180, Math.min(180, next)) });
+                }
+              }}
+            />
+            <span>{Math.round(transform.rotation)}°</span>
+          </div>
+          <div className="control-group">
+            <button type="button" onClick={handleResetTransformAndCrop}>Reset Transform/Crop</button>
+          </div>
+        </div>
+      )}
+
+      {!clip.textOverlay && (
+        <div className="effect-section">
+          <h4>Crop</h4>
+          <div className="control-group">
+            <label>Left:</label>
+            <input
+              type="range"
+              min="0"
+              max="0.45"
+              step="0.01"
+              value={crop.left}
+              onChange={(e) => handleCropChange({ left: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0"
+              max="45"
+              step="1"
+              value={Math.round(crop.left * 100)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleCropChange({ left: next / 100 });
+              }}
+            />
+            <span>{Math.round(crop.left * 100)}%</span>
+          </div>
+          <div className="control-group">
+            <label>Right:</label>
+            <input
+              type="range"
+              min="0"
+              max="0.45"
+              step="0.01"
+              value={crop.right}
+              onChange={(e) => handleCropChange({ right: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0"
+              max="45"
+              step="1"
+              value={Math.round(crop.right * 100)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleCropChange({ right: next / 100 });
+              }}
+            />
+            <span>{Math.round(crop.right * 100)}%</span>
+          </div>
+          <div className="control-group">
+            <label>Top:</label>
+            <input
+              type="range"
+              min="0"
+              max="0.45"
+              step="0.01"
+              value={crop.top}
+              onChange={(e) => handleCropChange({ top: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0"
+              max="45"
+              step="1"
+              value={Math.round(crop.top * 100)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleCropChange({ top: next / 100 });
+              }}
+            />
+            <span>{Math.round(crop.top * 100)}%</span>
+          </div>
+          <div className="control-group">
+            <label>Bottom:</label>
+            <input
+              type="range"
+              min="0"
+              max="0.45"
+              step="0.01"
+              value={crop.bottom}
+              onChange={(e) => handleCropChange({ bottom: parseFloat(e.target.value) })}
+            />
+            <input
+              type="number"
+              min="0"
+              max="45"
+              step="1"
+              value={Math.round(crop.bottom * 100)}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                if (Number.isFinite(next)) handleCropChange({ bottom: next / 100 });
+              }}
+            />
+            <span>{Math.round(crop.bottom * 100)}%</span>
+          </div>
+        </div>
+      )}
 
       <div className="effect-section">
         <h4>Applied Effects</h4>
@@ -189,6 +466,19 @@ export function EffectsPanel({ selectedClips, onUpdateClip }: EffectsPanelProps)
                 onChange={(e) =>
                   handleUpdateEffect(effect.id, { value: parseFloat(e.target.value) })
                 }
+              />
+              <input
+                type="number"
+                min="-100"
+                max="100"
+                step="1"
+                value={effect.value}
+                onChange={(e) => {
+                  const next = parseFloat(e.target.value);
+                  if (Number.isFinite(next)) {
+                    handleUpdateEffect(effect.id, { value: Math.max(-100, Math.min(100, next)) });
+                  }
+                }}
               />
               <span>{effect.value}</span>
             </div>

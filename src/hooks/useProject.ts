@@ -1,8 +1,43 @@
 import { useState, useCallback, useEffect } from 'react';
-import { Project, Clip, Track, MediaFile, Transition } from '../types';
+import { Project, Clip, Track, MediaFile, Transition, TextOverlay } from '../types';
 import { createMediaFile } from '../utils/mediaUtils';
 import { getProjectDuration, getClipEndTime, getClipDuration, getClipSourceDuration } from '../utils/timelineUtils';
 import { saveProject as saveToIndexedDB } from '../utils/indexedDB';
+
+function createDefaultTextOverlay(content: string = 'New Text'): TextOverlay {
+  return {
+    content,
+    duration: 3,
+    x: 0.5,
+    y: 0.85,
+    fontSize: 48,
+    color: '#ffffff',
+    fontFamily: 'Arial',
+    fontWeight: 'bold',
+    fontStyle: 'normal',
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+    align: 'center',
+  };
+}
+
+function createDefaultTransform() {
+  return {
+    x: 0,
+    y: 0,
+    scaleX: 1,
+    scaleY: 1,
+    rotation: 0,
+  };
+}
+
+function createDefaultCrop() {
+  return {
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+  };
+}
 
 export function useProject() {
   const [project, setProject] = useState<Project>(() => ({
@@ -120,6 +155,8 @@ export function useProject() {
         opacity: 1,
         speed: 1,
         reverse: false,
+        transform: createDefaultTransform(),
+        crop: createDefaultCrop(),
       };
 
       // Create a derived audio MediaFile referencing the same file/url
@@ -144,6 +181,8 @@ export function useProject() {
         opacity: 1,
         speed: 1,
         reverse: false,
+        transform: createDefaultTransform(),
+        crop: createDefaultCrop(),
       };
 
       // Find the first audio track, or insert a new one after all video tracks
@@ -206,6 +245,49 @@ export function useProject() {
         opacity: 1,
         speed: 1,
         reverse: false,
+        transform: createDefaultTransform(),
+        crop: createDefaultCrop(),
+      };
+
+      const updatedTracks = prev.tracks.map(t =>
+        t.id === trackId
+          ? { ...t, clips: [...t.clips, newClip] }
+          : t
+      );
+
+      const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
+
+      return {
+        ...prev,
+        tracks: updatedTracks,
+        duration,
+        updatedAt: Date.now(),
+      };
+    });
+  }, []);
+
+  const addTextClip = useCallback((trackId: string, startTime: number, content: string = 'New Text') => {
+    setProject(prev => {
+      const track = prev.tracks.find(t => t.id === trackId);
+      if (!track || track.type !== 'video') return prev;
+
+      const framerate = prev.framerate || 30;
+      const quantizedStartTime = Math.round(startTime * framerate) / framerate;
+      const textOverlay = createDefaultTextOverlay(content);
+
+      const newClip: Clip = {
+        id: crypto.randomUUID(),
+        mediaId: '',
+        startTime: quantizedStartTime,
+        trimStart: 0,
+        trimEnd: 0,
+        effects: [],
+        opacity: 1,
+        speed: 1,
+        reverse: false,
+        transform: createDefaultTransform(),
+        crop: createDefaultCrop(),
+        textOverlay,
       };
 
       const updatedTracks = prev.tracks.map(t =>
@@ -232,9 +314,10 @@ export function useProject() {
       if (!clip) return prev;
 
       const mediaFile = prev.mediaFiles.find(m => m.id === clip.mediaId);
-      if (!mediaFile) return prev;
+      const isTextClip = Boolean(clip.textOverlay);
+      if (!mediaFile && !isTextClip) return prev;
 
-      const framerate = mediaFile.framerate || prev.framerate || 30;
+      const framerate = mediaFile?.framerate || prev.framerate || 30;
 
       const quantizedUpdates: Partial<Clip> = { ...updates };
       if (updates.startTime !== undefined) {
@@ -246,6 +329,18 @@ export function useProject() {
       if (updates.trimEnd !== undefined) {
         quantizedUpdates.trimEnd = Math.round(updates.trimEnd * framerate) / framerate;
       }
+      if (updates.textOverlay?.duration !== undefined) {
+        quantizedUpdates.textOverlay = {
+          ...(clip.textOverlay ?? createDefaultTextOverlay()),
+          ...updates.textOverlay,
+          duration: Math.max(1 / framerate, Math.round(updates.textOverlay.duration * framerate) / framerate),
+        };
+      } else if (updates.textOverlay !== undefined) {
+        quantizedUpdates.textOverlay = {
+          ...(clip.textOverlay ?? createDefaultTextOverlay()),
+          ...updates.textOverlay,
+        };
+      }
 
       const hasTimingUpdates =
         quantizedUpdates.startTime !== undefined ||
@@ -255,7 +350,7 @@ export function useProject() {
 
       // Backward compatibility: older projects may not have explicit linkedClipId.
       // Infer a likely counterpart on the opposite track type when timing-matching.
-      const inferredLinkedClipId = !clip.linkedClipId && sourceTrack
+      const inferredLinkedClipId = !clip.linkedClipId && sourceTrack && mediaFile
         ? prev.tracks
             .filter(t => t.type !== sourceTrack.type)
             .flatMap(t => t.clips)
@@ -271,6 +366,35 @@ export function useProject() {
             })?.id
         : undefined;
       const linkedClipId = clip.linkedClipId ?? inferredLinkedClipId;
+
+      if (isTextClip) {
+        const updatedTracks = prev.tracks.map(track => ({
+          ...track,
+          clips: track.clips.map(c => {
+            if (c.id !== clipId) return c;
+            const nextStart = Math.max(0, quantizedUpdates.startTime ?? c.startTime);
+            const nextOverlay = quantizedUpdates.textOverlay
+              ? {
+                  ...(c.textOverlay ?? createDefaultTextOverlay()),
+                  ...quantizedUpdates.textOverlay,
+                }
+              : c.textOverlay;
+            return {
+              ...c,
+              startTime: nextStart,
+              textOverlay: nextOverlay,
+            };
+          }),
+        }));
+
+        const duration = getProjectDuration(updatedTracks, prev.mediaFiles);
+        return {
+          ...prev,
+          tracks: updatedTracks,
+          duration,
+          updatedAt: Date.now(),
+        };
+      }
 
       const linkedTimingUpdates: Partial<Clip> = hasTimingUpdates ? {
         ...(quantizedUpdates.startTime !== undefined ? { startTime: quantizedUpdates.startTime } : {}),
@@ -423,7 +547,6 @@ export function useProject() {
       if (!mediaFile) return prev;
 
       const clipDuration = getClipDuration(clip, mediaFile);
-      const clipEndTime = getClipEndTime(clip, mediaFile);
 
       const updatedTracks = prev.tracks.map(track => {
         const clipIndex = track.clips.findIndex(c => c.id === clipId);
@@ -508,7 +631,7 @@ export function useProject() {
 
         const clip = track.clips[clipIndex];
         const mediaFile = prev.mediaFiles.find(m => m.id === clip.mediaId);
-        if (!mediaFile) return track;
+        if (!mediaFile && !clip.textOverlay) return track;
 
         const newStartTime = getClipEndTime(clip, mediaFile);
         const newClip: Clip = {
@@ -557,7 +680,8 @@ export function useProject() {
         const track = updatedTracks[loc.trackIndex];
         const clip = track.clips[loc.clipIndex];
         const mediaFile = prev.mediaFiles.find(m => m.id === clip.mediaId);
-        if (!mediaFile) return null;
+        const isTextClip = Boolean(clip.textOverlay);
+        if (!mediaFile && !isTextClip) return null;
 
         const clipDuration = getClipDuration(clip, mediaFile);
         const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
@@ -569,14 +693,30 @@ export function useProject() {
         const secondId = crypto.randomUUID();
         const firstClip: Clip = {
           ...clip,
-          trimEnd: clip.trimEnd + (sourceDuration - sourceSplitOffset),
+          trimEnd: isTextClip ? clip.trimEnd : clip.trimEnd + (sourceDuration - sourceSplitOffset),
+          ...(isTextClip && clip.textOverlay
+            ? {
+                textOverlay: {
+                  ...clip.textOverlay,
+                  duration: relativeSplitTime,
+                },
+              }
+            : {}),
         };
         const secondClip: Clip = {
           ...clip,
           id: secondId,
           startTime: quantizedSplitTime,
-          trimStart: clip.trimStart + sourceSplitOffset,
+          trimStart: isTextClip ? clip.trimStart : clip.trimStart + sourceSplitOffset,
           linkedClipId: undefined,
+          ...(isTextClip && clip.textOverlay
+            ? {
+                textOverlay: {
+                  ...clip.textOverlay,
+                  duration: Math.max(1 / (prev.framerate || 30), clipDuration - relativeSplitTime),
+                },
+              }
+            : {}),
         };
 
         track.clips[loc.clipIndex] = firstClip;
@@ -589,10 +729,11 @@ export function useProject() {
       const primaryClip = updatedTracks[primaryLoc.trackIndex].clips[primaryLoc.clipIndex];
       const primaryTrackType = updatedTracks[primaryLoc.trackIndex].type;
       const primaryMedia = mediaById.get(primaryClip.mediaId);
+      const isPrimaryTextClip = Boolean(primaryClip.textOverlay);
 
       // Backward compatibility: older projects may not have explicit linkedClipId.
       // Infer likely counterpart on opposite track with same source/timing.
-      const inferredLinkedId = (!primaryClip.linkedClipId && primaryMedia)
+      const inferredLinkedId = (!isPrimaryTextClip && !primaryClip.linkedClipId && primaryMedia)
         ? updatedTracks
             .filter(t => t.type !== primaryTrackType)
             .flatMap(t => t.clips)
@@ -607,7 +748,7 @@ export function useProject() {
               );
             })?.id
         : undefined;
-      const linkedId = primaryClip.linkedClipId ?? inferredLinkedId;
+      const linkedId = isPrimaryTextClip ? undefined : (primaryClip.linkedClipId ?? inferredLinkedId);
 
       const primarySplit = splitOne(clipId);
       let linkedSplit: { firstId: string; secondId: string } | null = null;
@@ -708,6 +849,8 @@ export function useProject() {
         ...clip,
         speed: clip.speed && clip.speed > 0 ? clip.speed : 1,
         reverse: Boolean(clip.reverse),
+        transform: clip.transform ?? createDefaultTransform(),
+        crop: clip.crop ?? createDefaultCrop(),
       })),
     }));
 
@@ -746,6 +889,7 @@ export function useProject() {
     deleteTrack,
     reorderTracks,
     addClipToTrack,
+    addTextClip,
     addVideoWithLinkedAudio,
     updateClip,
     moveClipToTrack,

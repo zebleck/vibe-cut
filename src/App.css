@@ -218,6 +218,8 @@ body {
 .video-preview video {
   max-width: 100%;
   max-height: 100%;
+  object-fit: contain;
+  will-change: transform, clip-path;
 }
 
 .video-preview audio {
@@ -231,6 +233,41 @@ body {
   right: 0;
   bottom: 0;
   background: #000;
+}
+
+.preview-output-frame {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  border: 2px solid rgba(74, 158, 255, 0.9);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7) inset;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.preview-output-label {
+  position: absolute;
+  top: -24px;
+  right: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: #e7f1ff;
+  background: rgba(20, 35, 58, 0.9);
+  border: 1px solid rgba(74, 158, 255, 0.8);
+  border-radius: 4px;
+}
+
+.preview-text-overlay {
+  position: absolute;
+  max-width: 85%;
+  padding: 0.2em 0.45em;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  line-height: 1.2;
+  pointer-events: none;
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
+  z-index: 4;
 }
 
 /* Playback Controls */
@@ -554,6 +591,16 @@ body {
   gap: 0.5rem;
 }
 
+.effects-panel .control-group input[type="number"] {
+  width: 74px;
+  padding: 0.2rem 0.35rem;
+  background: #2a2a2a;
+  border: 1px solid #4a4a4a;
+  color: #e0e0e0;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
 .tracks-section {
   margin-bottom: 1rem;
 }
@@ -590,6 +637,11 @@ body {
 .timeline-clip.selected {
   border: 2px solid #ffaa00;
   box-shadow: 0 0 8px rgba(255, 170, 0, 0.5);
+}
+
+.timeline-clip.text-clip {
+  background: linear-gradient(135deg, #9b5cf6 0%, #7d3cd2 100%);
+  border-color: #b784ff;
 }
 
 .clip-thumbnail {
@@ -973,6 +1025,17 @@ body {
 .effects-panel h3 {
   margin: 0 0 1rem 0;
   font-size: 1rem;
+}
+
+.text-panel-input,
+.effects-panel textarea {
+  width: 100%;
+  padding: 0.5rem;
+  background: #2a2a2a;
+  border: 1px solid #4a4a4a;
+  color: #e0e0e0;
+  border-radius: 4px;
+  font-size: 0.85rem;
 }
 
 .empty-message {

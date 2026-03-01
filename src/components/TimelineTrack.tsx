@@ -53,7 +53,6 @@ export function TimelineTrack({
 }: TimelineTrackProps) {
   const duration = Math.max(...track.clips.map(clip => {
     const mediaFile = mediaFiles.find(m => m.id === clip.mediaId);
-    if (!mediaFile) return 0;
     return clip.startTime + getClipDuration(clip, mediaFile);
   }), 10);
   const timelineWidth = timeToPixels(duration, zoom);
@@ -110,7 +109,7 @@ export function TimelineTrack({
           )}
           {track.clips.map(clip => {
             const mediaFile = mediaFiles.find(m => m.id === clip.mediaId);
-            if (!mediaFile) return null;
+            if (!mediaFile && !clip.textOverlay) return null;
 
             const clipDuration = getClipDuration(clip, mediaFile);
             const clipWidth = timeToPixels(clipDuration, zoom);
