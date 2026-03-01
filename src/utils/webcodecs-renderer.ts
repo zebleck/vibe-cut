@@ -2,7 +2,7 @@ import { createFile as createMP4File, DataStream } from 'mp4box';
 import { Muxer as Mp4Muxer, ArrayBufferTarget as Mp4Target } from 'mp4-muxer';
 import { Muxer as WebmMuxer, ArrayBufferTarget as WebmTarget } from 'webm-muxer';
 import { Project, RenderSettings, RenderProgress, Clip, MediaFile } from '../types';
-import { getClipDuration } from './timelineUtils';
+import { getClipDuration, getClipSourceDuration } from './timelineUtils';
 
 export function isWebCodecsSupported(): boolean {
   return (
@@ -146,7 +146,7 @@ export async function renderWithWebCodecs(
   if (!hasVideo) throw new Error('WebCodecs requires video clips; use FFmpeg for audio-only.');
 
   const isMp4 = settings.format === 'mp4';
-  const totalFrames = Math.ceil(project.duration * settings.framerate);
+  const totalFrames = Math.max(1, Math.ceil(project.duration * settings.framerate));
   const frameDurationSec = 1 / settings.framerate;
   const frameDurationUs = 1_000_000 / settings.framerate;
 
@@ -245,9 +245,9 @@ export async function renderWithWebCodecs(
     const demuxed = demuxedFiles.get(mediaFile.id);
     if (!demuxed) continue;
 
-    const clipDur = getClipDuration(clip, mediaFile);
+    const sourceDur = getClipSourceDuration(clip, mediaFile);
     const trimStartUs = clip.trimStart * 1_000_000;
-    const trimEndUs = (clip.trimStart + clipDur) * 1_000_000;
+    const trimEndUs = (clip.trimStart + sourceDur) * 1_000_000;
 
     // Find keyframe before trim start
     let startIdx = 0;
@@ -392,7 +392,13 @@ export async function renderWithWebCodecs(
         const clipDur = getClipDuration(clip, mediaFile);
         if (time < clip.startTime || time >= clip.startTime + clipDur) continue;
 
-        const clipTime = time - clip.startTime + clip.trimStart;
+        const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
+        const sourceOffset = (time - clip.startTime) * speed;
+        const sourceStart = clip.trimStart;
+        const sourceEnd = Math.max(sourceStart, mediaFile.duration - clip.trimEnd);
+        const clipTime = clip.reverse
+          ? Math.max(sourceStart, sourceEnd - sourceOffset)
+          : Math.min(sourceEnd, sourceStart + sourceOffset);
         const clipTimeUs = Math.round(clipTime * 1_000_000);
 
         // Fast path: streaming VideoDecoder
@@ -491,13 +497,18 @@ async function encodeAudio(
       const audioBuf = await offlineCtx.decodeAudioData(buf);
       const source = offlineCtx.createBufferSource();
       source.buffer = audioBuf;
+      source.playbackRate.value = clip.speed && clip.speed > 0 ? clip.speed : 1;
       source.connect(offlineCtx.destination);
       // decodeAudioData may include encoder priming/delay samples at the start
       // (e.g. AAC encoder delay ≈ 21–24 ms). mediaFile.duration is the true
       // playback duration reported by the browser (priming already excluded),
       // so any excess in audioBuf.duration is preamble that must be skipped.
       const preamble = Math.max(0, audioBuf.duration - mediaFile.duration);
-      source.start(clip.startTime, clip.trimStart + preamble, getClipDuration(clip, mediaFile));
+      source.start(
+        clip.startTime,
+        clip.trimStart + preamble,
+        getClipSourceDuration(clip, mediaFile)
+      );
     } catch (e) {
       console.warn('Failed to decode audio clip, skipping:', e);
     }

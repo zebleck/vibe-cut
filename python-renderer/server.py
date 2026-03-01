@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 
 app = FastAPI(title="Vibe Python Renderer")
-RENDERER_VERSION = "2026-02-19-concat-v1"
+RENDERER_VERSION = "2026-02-27-speed-v2"
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +27,61 @@ def _safe_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
 
 
+def _probe_stream_types(path: str) -> Set[str]:
+    """Return stream codec types (e.g. {'video', 'audio'}) for a media file."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return set()
+        data = json.loads(proc.stdout)
+        streams = data.get("streams", [])
+        return {
+            s.get("codec_type")
+            for s in streams
+            if isinstance(s, dict) and isinstance(s.get("codec_type"), str)
+        }
+    except Exception:
+        return set()
+
+
 def _clip_duration(clip: Dict[str, Any], media: Dict[str, Any]) -> float:
+    speed = max(0.01, float(clip.get("speed", 1.0)))
+    source_duration = max(0.0, float(media["duration"]) - float(clip["trimStart"]) - float(clip["trimEnd"]))
+    return source_duration / speed
+
+
+def _clip_source_duration(clip: Dict[str, Any], media: Dict[str, Any]) -> float:
     return max(0.0, float(media["duration"]) - float(clip["trimStart"]) - float(clip["trimEnd"]))
+
+
+def _atempo_chain(speed: float) -> List[str]:
+    # FFmpeg atempo supports 0.5..2.0 per stage, so chain factors when needed.
+    filters: List[str] = []
+    remaining = speed
+
+    while remaining > 2.0:
+        filters.append("atempo=2")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+
+    filters.append(f"atempo={_fmt(remaining)}")
+    return filters
 
 
 def _fmt(v: float) -> str:
@@ -69,6 +122,9 @@ async def render(request: Request, background_tasks: BackgroundTasks):
             media_paths[media_id] = str(target)
 
         media_map = {m["id"]: m for m in project["mediaFiles"]}
+        stream_types_by_media: Dict[str, Set[str]] = {}
+        for media_id, media_path in media_paths.items():
+            stream_types_by_media[media_id] = _probe_stream_types(media_path)
 
         video_tracks = [t for t in project["tracks"] if t["type"] == "video"]
         audio_tracks = [t for t in project["tracks"] if t["type"] == "audio"]
@@ -78,6 +134,11 @@ async def render(request: Request, background_tasks: BackgroundTasks):
             for clip in track["clips"]:
                 media = media_map.get(clip["mediaId"])
                 if media:
+                    stream_types = stream_types_by_media.get(media["id"], set())
+                    has_video_stream = "video" in stream_types or (not stream_types and media.get("type") == "video")
+                    if not has_video_stream:
+                        print(f"[SKIP] clip {clip.get('id', '?')} has no video stream in media {media['id']}")
+                        continue
                     all_video.append({"clip": clip, "media": media, "trackIndex": ti})
         all_video.sort(key=lambda x: float(x["clip"]["startTime"]))
 
@@ -86,6 +147,11 @@ async def render(request: Request, background_tasks: BackgroundTasks):
             for clip in track["clips"]:
                 media = media_map.get(clip["mediaId"])
                 if media:
+                    stream_types = stream_types_by_media.get(media["id"], set())
+                    has_audio_stream = "audio" in stream_types or (not stream_types and media.get("type") == "audio")
+                    if not has_audio_stream:
+                        print(f"[SKIP] clip {clip.get('id', '?')} has no audio stream in media {media['id']}")
+                        continue
                     all_audio.append({"clip": clip, "media": media, "trackIndex": ti})
         all_audio.sort(key=lambda x: float(x["clip"]["startTime"]))
 
@@ -96,9 +162,10 @@ async def render(request: Request, background_tasks: BackgroundTasks):
         height = int(settings["height"])
         framerate = int(settings["framerate"])
         duration = float(project["duration"])
+        output_duration = max(duration, 1.0 / framerate)
 
         # --------------- Inputs (dedup by file path) ---------------
-        args: List[str] = ["ffmpeg", "-y"]
+        args: List[str] = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         input_index: Dict[str, int] = {}
         path_to_idx: Dict[str, int] = {}
         idx = 0
@@ -131,7 +198,10 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                 media = item["media"]
                 clip_start = float(clip["startTime"])
                 clip_dur = _clip_duration(clip, media)
+                src_dur = _clip_source_duration(clip, media)
                 trim_start = float(clip["trimStart"])
+                speed = max(0.01, float(clip.get("speed", 1.0)))
+                reverse = bool(clip.get("reverse", False))
                 src_idx = input_index[media["id"]]
 
                 gap = clip_start - current_t
@@ -145,9 +215,11 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                     seg_idx += 1
 
                 lbl = f"s{seg_idx}"
+                video_effects = ["reverse"] if reverse else []
+                video_effects.append(f"setpts=(PTS-STARTPTS)/{_fmt(speed)}")
                 filter_parts.append(
-                    f"[{src_idx}:v]trim=start={_fmt(trim_start)}:duration={_fmt(clip_dur)},"
-                    f"setpts=PTS-STARTPTS,fps={framerate},"
+                    f"[{src_idx}:v]trim=start={_fmt(trim_start)}:duration={_fmt(src_dur)},"
+                    f"{','.join(video_effects)},fps={framerate},"
                     f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                     f"format=yuv420p,setsar=1[{lbl}]"
@@ -159,7 +231,7 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                 print(f"[V-SEG] clip {clip['id'][:8]} src={src_idx} "
                       f"trim={_fmt(trim_start)}+{_fmt(clip_dur)} @timeline={_fmt(clip_start)}")
 
-            trail = duration - current_t
+            trail = output_duration - current_t
             if trail > frame_dur:
                 lbl = f"s{seg_idx}"
                 filter_parts.append(
@@ -182,7 +254,10 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                 media = item["media"]
                 clip_start = float(clip["startTime"])
                 clip_dur = _clip_duration(clip, media)
+                src_dur = _clip_source_duration(clip, media)
                 trim_start = float(clip["trimStart"])
+                speed = max(0.01, float(clip.get("speed", 1.0)))
+                reverse = bool(clip.get("reverse", False))
                 src_idx = input_index[media["id"]]
 
                 gap = clip_start - current_t
@@ -196,9 +271,11 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                     seg_idx += 1
 
                 lbl = f"s{seg_idx}"
+                audio_effects = ["areverse"] if reverse else []
+                audio_effects.extend(_atempo_chain(speed))
                 filter_parts.append(
-                    f"[{src_idx}:a]atrim=start={_fmt(trim_start)}:duration={_fmt(clip_dur)},"
-                    f"asetpts=PTS-STARTPTS,"
+                    f"[{src_idx}:a]atrim=start={_fmt(trim_start)}:duration={_fmt(src_dur)},"
+                    f"asetpts=PTS-STARTPTS,{','.join(audio_effects)},"
                     f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{lbl}]"
                 )
                 audio_segments.append(f"[{lbl}]")
@@ -208,7 +285,7 @@ async def render(request: Request, background_tasks: BackgroundTasks):
                 print(f"[A-SEG] clip {clip['id'][:8]} src={src_idx} "
                       f"trim={_fmt(trim_start)}+{_fmt(clip_dur)} @timeline={_fmt(clip_start)}")
 
-            trail = duration - current_t
+            trail = output_duration - current_t
             if trail > 0.001:
                 lbl = f"s{seg_idx}"
                 filter_parts.append(
@@ -249,13 +326,14 @@ async def render(request: Request, background_tasks: BackgroundTasks):
             else:
                 args.extend(["-c:a", "libopus", "-b:a", "128k"])
 
-        args.extend(["-t", str(duration), out_path])
+        args.extend(["-t", str(output_duration), out_path])
 
         print(f"[CMD] {' '.join(args[:6])} ... ({len(args)} args total)")
         proc = subprocess.run(args, capture_output=True, text=True)
         if proc.returncode != 0 or not os.path.exists(out_path):
-            err_tail = (proc.stderr or "Unknown ffmpeg error")[-4000:]
-            raise HTTPException(status_code=500, detail=f"FFmpeg failed:\n{err_tail}")
+            stderr = (proc.stderr or "Unknown ffmpeg error").strip()
+            err_lines = "\n".join(stderr.splitlines()[-25:]) if stderr else "Unknown ffmpeg error"
+            raise HTTPException(status_code=500, detail=f"FFmpeg failed:\n{err_lines}")
 
         background_tasks.add_task(shutil.rmtree, temp_dir, True)
         mime = "video/mp4" if output_format == "mp4" else "video/webm"

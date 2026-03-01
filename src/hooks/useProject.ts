@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { Project, Clip, Track, MediaFile, Transition } from '../types';
 import { createMediaFile } from '../utils/mediaUtils';
-import { getProjectDuration, getClipEndTime, getClipDuration } from '../utils/timelineUtils';
+import { getProjectDuration, getClipEndTime, getClipDuration, getClipSourceDuration } from '../utils/timelineUtils';
 import { saveProject as saveToIndexedDB } from '../utils/indexedDB';
 
 export function useProject() {
@@ -251,6 +251,7 @@ export function useProject() {
         quantizedUpdates.startTime !== undefined ||
         quantizedUpdates.trimStart !== undefined ||
         quantizedUpdates.trimEnd !== undefined;
+      const hasSpeedUpdate = quantizedUpdates.speed !== undefined;
 
       // Backward compatibility: older projects may not have explicit linkedClipId.
       // Infer a likely counterpart on the opposite track type when timing-matching.
@@ -276,6 +277,9 @@ export function useProject() {
         ...(quantizedUpdates.trimStart !== undefined ? { trimStart: quantizedUpdates.trimStart } : {}),
         ...(quantizedUpdates.trimEnd !== undefined ? { trimEnd: quantizedUpdates.trimEnd } : {}),
       } : {};
+      const linkedSpeedUpdates: Partial<Clip> = hasSpeedUpdate
+        ? { speed: Math.max(0.01, quantizedUpdates.speed as number) }
+        : {};
 
       const mediaById = new Map(prev.mediaFiles.map(m => [m.id, m]));
       const clampTiming = (targetClip: Clip, incoming: Partial<Clip>): Partial<Clip> => {
@@ -312,14 +316,22 @@ export function useProject() {
             return {
               ...c,
               ...(inferredLinkedClipId ? { linkedClipId: inferredLinkedClipId } : {}),
-              ...clampTiming(c, quantizedUpdates),
+              ...clampTiming(c, {
+                ...quantizedUpdates,
+                ...(quantizedUpdates.speed !== undefined
+                  ? { speed: Math.max(0.01, quantizedUpdates.speed) }
+                  : {}),
+              }),
             };
           }
-          if (hasTimingUpdates && linkedClipId && c.id === linkedClipId) {
+          if ((hasTimingUpdates || hasSpeedUpdate) && linkedClipId && c.id === linkedClipId) {
             return {
               ...c,
               ...(inferredLinkedClipId ? { linkedClipId: clipId } : {}),
-              ...clampTiming(c, linkedTimingUpdates),
+              ...clampTiming(c, {
+                ...linkedTimingUpdates,
+                ...linkedSpeedUpdates,
+              }),
             };
           }
           return c;
@@ -548,19 +560,22 @@ export function useProject() {
         if (!mediaFile) return null;
 
         const clipDuration = getClipDuration(clip, mediaFile);
+        const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
+        const sourceDuration = getClipSourceDuration(clip, mediaFile);
         const relativeSplitTime = quantizedSplitTime - clip.startTime;
         if (relativeSplitTime <= 0 || relativeSplitTime >= clipDuration) return null;
+        const sourceSplitOffset = relativeSplitTime * speed;
 
         const secondId = crypto.randomUUID();
         const firstClip: Clip = {
           ...clip,
-          trimEnd: clip.trimEnd + (clipDuration - relativeSplitTime),
+          trimEnd: clip.trimEnd + (sourceDuration - sourceSplitOffset),
         };
         const secondClip: Clip = {
           ...clip,
           id: secondId,
           startTime: quantizedSplitTime,
-          trimStart: clip.trimStart + relativeSplitTime,
+          trimStart: clip.trimStart + sourceSplitOffset,
           linkedClipId: undefined,
         };
 
@@ -687,9 +702,19 @@ export function useProject() {
       return mf;
     });
 
+    const tracks = projectData.tracks.map(track => ({
+      ...track,
+      clips: track.clips.map(clip => ({
+        ...clip,
+        speed: clip.speed && clip.speed > 0 ? clip.speed : 1,
+        reverse: Boolean(clip.reverse),
+      })),
+    }));
+
     setProject({
       ...projectData,
       mediaFiles,
+      tracks,
       updatedAt: Date.now(),
     });
   }, []);

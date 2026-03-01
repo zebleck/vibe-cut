@@ -13,6 +13,22 @@ const DRIFT_THRESHOLD = 0.3;
 // When scrubbing (paused), seek more precisely
 const SCRUB_THRESHOLD = 0.05;
 
+function getPreviewTime(
+  clip: Clip,
+  mediaFile: MediaFile,
+  timelineTime: number
+): { clipTime: number; speed: number } {
+  const speed = clip.speed && clip.speed > 0 ? clip.speed : 1;
+  const timelineOffset = Math.max(0, timelineTime - clip.startTime);
+  const sourceOffset = timelineOffset * speed;
+  const sourceStart = clip.trimStart;
+  const sourceEnd = Math.max(sourceStart, mediaFile.duration - clip.trimEnd);
+  const clipTime = clip.reverse
+    ? Math.max(sourceStart, sourceEnd - sourceOffset)
+    : Math.min(sourceEnd, sourceStart + sourceOffset);
+  return { clipTime, speed };
+}
+
 export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -58,8 +74,8 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
       if (clip) {
         const mediaFile = mediaMap.get(clip.mediaId);
         if (mediaFile) {
-          const clipTime = currentTime - clip.startTime + clip.trimStart;
-          return { clip, mediaFile, clipTime };
+          const { clipTime, speed } = getPreviewTime(clip, mediaFile, currentTime);
+          return { clip, mediaFile, clipTime, speed };
         }
       }
     }
@@ -73,13 +89,14 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
       if (linked) {
         const linkedMedia = mediaMap.get(linked.mediaId);
         if (linkedMedia && linkedMedia.type === 'audio') {
-          const linkedDuration = Math.max(0, linkedMedia.duration - linked.trimStart - linked.trimEnd);
+          const linkedSpeed = linked.speed && linked.speed > 0 ? linked.speed : 1;
+          const linkedDuration = Math.max(0, linkedMedia.duration - linked.trimStart - linked.trimEnd) / linkedSpeed;
           const inLinkedRange =
             currentTime >= linked.startTime &&
             currentTime < linked.startTime + linkedDuration;
           if (inLinkedRange) {
-            const clipTime = currentTime - linked.startTime + linked.trimStart;
-            return { clip: linked, mediaFile: linkedMedia, clipTime };
+            const { clipTime, speed } = getPreviewTime(linked, linkedMedia, currentTime);
+            return { clip: linked, mediaFile: linkedMedia, clipTime, speed };
           }
         }
       }
@@ -91,8 +108,8 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
       if (clip) {
         const mediaFile = mediaMap.get(clip.mediaId);
         if (mediaFile && mediaFile.type === 'audio') {
-          const clipTime = currentTime - clip.startTime + clip.trimStart;
-          return { clip, mediaFile, clipTime };
+          const { clipTime, speed } = getPreviewTime(clip, mediaFile, currentTime);
+          return { clip, mediaFile, clipTime, speed };
         }
       }
     }
@@ -106,11 +123,11 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     if (!video) return;
 
     if (videoClipInfo) {
-      const { mediaFile, clipTime } = videoClipInfo;
+      const { mediaFile, clipTime, speed } = videoClipInfo;
       setHasVideoAtTime(true);
 
       try {
-        // Source changed — load new media
+        // Source changed - load new media
         if (currentMediaIdRef.current !== mediaFile.id) {
           currentMediaIdRef.current = mediaFile.id;
           pendingSeekRef.current = clipTime;
@@ -125,6 +142,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
         } else {
           pendingSeekRef.current = clipTime;
         }
+        video.playbackRate = speed;
       } catch (error) {
         console.warn('Error updating video preview:', error);
       }
@@ -146,7 +164,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
     if (!audio) return;
 
     if (audioClipInfo) {
-      const { mediaFile, clipTime } = audioClipInfo;
+      const { mediaFile, clipTime, speed } = audioClipInfo;
 
       try {
         if (currentAudioIdRef.current !== mediaFile.id) {
@@ -163,6 +181,7 @@ export function VideoPreview({ project, currentTime, isPlaying }: VideoPreviewPr
         } else {
           pendingAudioSeekRef.current = clipTime;
         }
+        audio.playbackRate = speed;
       } catch (error) {
         console.warn('Error updating audio preview:', error);
       }

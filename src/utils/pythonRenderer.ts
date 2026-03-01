@@ -1,7 +1,7 @@
 import { Project, RenderProgress, RenderSettings } from '../types';
 
 const PYTHON_RENDER_URL = 'http://127.0.0.1:8765';
-const REQUIRED_PYTHON_RENDERER_VERSION = '2026-02-19-concat-v1';
+const REQUIRED_PYTHON_RENDERER_VERSION = '2026-02-27-speed-v2';
 
 type PythonHealth = {
   status: string;
@@ -60,6 +60,8 @@ export async function renderWithPythonService(
         startTime: c.startTime,
         trimStart: c.trimStart,
         trimEnd: c.trimEnd,
+        speed: c.speed,
+        reverse: c.reverse,
       })),
     })),
     mediaFiles: project.mediaFiles.map(m => ({

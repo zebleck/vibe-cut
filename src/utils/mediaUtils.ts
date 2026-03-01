@@ -52,8 +52,10 @@ export async function createMediaFile(file: File): Promise<MediaFile> {
         const audioBuffer = await loadAudioBuffer(file);
         mediaFile.waveform = await generateWaveform(audioBuffer, 200);
       } catch {
-        // Video has no decodable audio despite audioTracks reporting it
-        mediaFile.hasAudio = false;
+        // Waveform generation failed but audio may still be present —
+        // decodeAudioData doesn't support all codecs (e.g. some AAC in MP4).
+        // Keep hasAudio true so the linked audio clip is still created.
+        console.warn('Could not decode audio for waveform, but keeping audio track');
       }
     }
   }

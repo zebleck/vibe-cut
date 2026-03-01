@@ -1,12 +1,30 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { Project, RenderSettings, RenderProgress } from '../types';
-import { getClipDuration } from './timelineUtils';
+import { getClipDuration, getClipSourceDuration } from './timelineUtils';
 import { isWebCodecsSupported, renderWithWebCodecs } from './webcodecs-renderer';
 import { getPythonRendererHealth, renderWithPythonService } from './pythonRenderer';
 
 let ffmpegInstance: FFmpeg | null = null;
 let initPromise: Promise<FFmpeg> | null = null;
+
+function buildAtempoFilters(speed: number): string[] {
+  // FFmpeg atempo supports 0.5-2.0 per stage, so chain as needed.
+  const filters: string[] = [];
+  let remaining = speed;
+
+  while (remaining > 2) {
+    filters.push('atempo=2');
+    remaining /= 2;
+  }
+  while (remaining < 0.5) {
+    filters.push('atempo=0.5');
+    remaining /= 0.5;
+  }
+
+  filters.push(`atempo=${remaining.toFixed(6)}`);
+  return filters;
+}
 
 export async function initFFmpeg(): Promise<FFmpeg> {
   if (ffmpegInstance) return ffmpegInstance;
@@ -100,12 +118,12 @@ export async function renderProject(
     }
   }
 
-  const useWebCodecs =
-    requestedEngine === 'gpu'
-      ? canUseWebCodecs
-      : requestedEngine === 'compatibility' || requestedEngine === 'python'
-        ? false
-        : canUseWebCodecs;
+  let useWebCodecs = false;
+  if (requestedEngine === 'gpu') {
+    useWebCodecs = canUseWebCodecs;
+  } else if (requestedEngine === 'auto') {
+    useWebCodecs = canUseWebCodecs;
+  }
 
   if (useWebCodecs) {
     try {
@@ -260,6 +278,7 @@ export async function renderProject(
 
     const filterParts: string[] = [];
     const frameDur = 1 / settings.framerate;
+    const outputDuration = Math.max(project.duration, frameDur);
     let segIdx = 0;
 
     // --- VIDEO TIMELINE (concat) ---
@@ -268,6 +287,8 @@ export async function renderProject(
       let currentT = 0;
       for (const item of allVideoClips) {
         const clipDuration = getClipDuration(item.clip, item.mediaFile);
+        const sourceDuration = getClipSourceDuration(item.clip, item.mediaFile);
+        const speed = item.clip.speed && item.clip.speed > 0 ? item.clip.speed : 1;
         const clipStart = item.clip.startTime;
         const trimStart = item.clip.trimStart;
         const inputIdx = inputMap.get(item.mediaFile.id)!;
@@ -283,9 +304,14 @@ export async function renderProject(
         }
 
         const lbl = `s${segIdx++}`;
+        const videoEffects: string[] = [];
+        if (item.clip.reverse) {
+          videoEffects.push('reverse');
+        }
+        videoEffects.push(`setpts=(PTS-STARTPTS)/${speed.toFixed(6)}`);
         filterParts.push(
-          `[${inputIdx}:v]trim=start=${trimStart.toFixed(6)}:duration=${clipDuration.toFixed(6)},` +
-          `setpts=PTS-STARTPTS,fps=${settings.framerate},` +
+          `[${inputIdx}:v]trim=start=${trimStart.toFixed(6)}:duration=${sourceDuration.toFixed(6)},` +
+          `${videoEffects.join(',')},fps=${settings.framerate},` +
           `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
           `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,` +
           `format=yuv420p,setsar=1[${lbl}]`
@@ -294,7 +320,7 @@ export async function renderProject(
         currentT = clipStart + clipDuration;
       }
 
-      const trail = project.duration - currentT;
+      const trail = outputDuration - currentT;
       if (trail > frameDur) {
         const lbl = `s${segIdx++}`;
         filterParts.push(
@@ -315,6 +341,8 @@ export async function renderProject(
       let currentT = 0;
       for (const item of allAudioClips) {
         const clipDuration = getClipDuration(item.clip, item.mediaFile);
+        const sourceDuration = getClipSourceDuration(item.clip, item.mediaFile);
+        const speed = item.clip.speed && item.clip.speed > 0 ? item.clip.speed : 1;
         const clipStart = item.clip.startTime;
         const trimStart = item.clip.trimStart;
         const inputIdx = inputMap.get(item.mediaFile.id)!;
@@ -330,16 +358,21 @@ export async function renderProject(
         }
 
         const lbl = `s${segIdx++}`;
+        const audioEffects: string[] = [];
+        if (item.clip.reverse) {
+          audioEffects.push('areverse');
+        }
+        audioEffects.push(...buildAtempoFilters(speed));
         filterParts.push(
-          `[${inputIdx}:a]atrim=start=${trimStart.toFixed(6)}:duration=${clipDuration.toFixed(6)},` +
-          `asetpts=PTS-STARTPTS,` +
+          `[${inputIdx}:a]atrim=start=${trimStart.toFixed(6)}:duration=${sourceDuration.toFixed(6)},` +
+          `asetpts=PTS-STARTPTS,${audioEffects.join(',')},` +
           `aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[${lbl}]`
         );
         audioSegments.push(`[${lbl}]`);
         currentT = clipStart + clipDuration;
       }
 
-      const trail = project.duration - currentT;
+      const trail = outputDuration - currentT;
       if (trail > 0.001) {
         const lbl = `s${segIdx++}`;
         filterParts.push(
@@ -403,7 +436,7 @@ export async function renderProject(
       );
     }
 
-    args.push('-t', project.duration.toString()); // Limit to project duration
+    args.push('-t', outputDuration.toString()); // Limit to project duration
     args.push('-y'); // Overwrite output file
     args.push(outputFileName);
 

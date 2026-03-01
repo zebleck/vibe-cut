@@ -1,10 +1,19 @@
 import { Clip, Track, MediaFile } from '../types';
 
-export function getClipDuration(clip: Clip, mediaFile: MediaFile): number {
+function getPlaybackSpeed(clip: Clip): number {
+  return clip.speed && clip.speed > 0 ? clip.speed : 1;
+}
+
+export function getClipSourceDuration(clip: Clip, mediaFile: MediaFile): number {
   const totalDuration = mediaFile.duration;
   const trimStart = clip.trimStart || 0;
   const trimEnd = clip.trimEnd || 0;
-  return totalDuration - trimStart - trimEnd;
+  return Math.max(0, totalDuration - trimStart - trimEnd);
+}
+
+export function getClipDuration(clip: Clip, mediaFile: MediaFile): number {
+  const speed = getPlaybackSpeed(clip);
+  return getClipSourceDuration(clip, mediaFile) / speed;
 }
 
 export function getClipEndTime(clip: Clip, mediaFile: MediaFile): number {

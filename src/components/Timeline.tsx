@@ -234,26 +234,28 @@ export function Timeline({
         }
 
         const { initialStartTime, initialTrimStart, initialTrimEnd, initialEndTime } = resizingClip;
+        const clip = project.tracks.flatMap(t => t.clips).find(c => c.id === resizingClip.clipId);
+        const speed = clip?.speed && clip.speed > 0 ? clip.speed : 1;
 
         if (resizingClip.side === 'left') {
           // Left resize: move left edge, keep right edge fixed
           // Clamp time to valid range
-          const minTime = initialStartTime - initialTrimStart; // Can't go before media start
+          const minTime = initialStartTime - (initialTrimStart / speed); // Can't go before media start
           const maxTime = initialEndTime - 0.01; // Can't go past right edge
           const clampedTime = Math.max(minTime, Math.min(maxTime, time));
 
           const newStartTime = clampedTime;
-          const newTrimStart = initialTrimStart + (clampedTime - initialStartTime);
+          const newTrimStart = initialTrimStart + ((clampedTime - initialStartTime) * speed);
 
           onClipUpdate(resizingClip.clipId, { startTime: newStartTime, trimStart: newTrimStart });
         } else {
           // Right resize: move right edge, keep left edge fixed
           // Clamp time to valid range
           const minTime = initialStartTime + 0.01; // Can't go before left edge
-          const maxTime = initialStartTime + mediaFile.duration - initialTrimStart; // Can't extend past media end
+          const maxTime = initialStartTime + ((mediaFile.duration - initialTrimStart) / speed); // Can't extend past media end
           const clampedTime = Math.max(minTime, Math.min(maxTime, time));
 
-          const newTrimEnd = mediaFile.duration - initialTrimStart - (clampedTime - initialStartTime);
+          const newTrimEnd = mediaFile.duration - initialTrimStart - ((clampedTime - initialStartTime) * speed);
 
           onClipUpdate(resizingClip.clipId, { trimEnd: Math.max(0, newTrimEnd) });
         }
