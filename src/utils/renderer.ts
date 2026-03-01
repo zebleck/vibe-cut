@@ -8,6 +8,19 @@ import { getPythonRendererHealth, renderWithPythonService } from './pythonRender
 let ffmpegInstance: FFmpeg | null = null;
 let initPromise: Promise<FFmpeg> | null = null;
 
+function escapeDrawtext(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/%/g, '\\%');
+}
+
+function clampCrop(value: number): number {
+  return Math.max(0, Math.min(0.45, value));
+}
+
 function buildAtempoFilters(speed: number): string[] {
   // FFmpeg atempo supports 0.5-2.0 per stage, so chain as needed.
   const filters: string[] = [];
@@ -94,11 +107,38 @@ export async function renderProject(
   const hasAudioClips = project.tracks.some(
     t => t.type === 'audio' && t.clips.length > 0,
   );
+  const hasTextOverlays = project.tracks.some(
+    t => t.type === 'video' && t.clips.some(c => Boolean(c.textOverlay))
+  );
+  const hasClipTransforms = project.tracks.some(
+    t => t.type === 'video' && t.clips.some(c => {
+      const transform = c.transform;
+      const crop = c.crop;
+      const hasTransform = Boolean(
+        transform &&
+        (Math.abs(transform.x) > 0.0001 ||
+          Math.abs(transform.y) > 0.0001 ||
+          Math.abs(transform.scaleX - 1) > 0.0001 ||
+          Math.abs(transform.scaleY - 1) > 0.0001 ||
+          Math.abs(transform.rotation) > 0.0001)
+      );
+      const hasCrop = Boolean(
+        crop &&
+        (crop.left > 0.0001 || crop.right > 0.0001 || crop.top > 0.0001 || crop.bottom > 0.0001)
+      );
+      return hasTransform || hasCrop;
+    })
+  );
   const requestedEngine = settings.renderEngine ?? 'auto';
   const webCodecsSupported = isWebCodecsSupported();
   const canUseWebCodecs = webCodecsSupported && !(settings.format === 'mp4' && hasAudioClips);
 
-  const shouldTryPython = requestedEngine === 'python' || requestedEngine === 'auto';
+  const shouldTryPython =
+    (requestedEngine === 'python' || requestedEngine === 'auto') &&
+    !hasClipTransforms;
+  if (requestedEngine === 'python' && hasClipTransforms) {
+    throw new Error('Python renderer does not yet support transform/crop clips. Use Auto/GPU/Compatibility render engines.');
+  }
   if (shouldTryPython) {
     const health = await getPythonRendererHealth(signal);
     if (health) {
@@ -202,6 +242,16 @@ export async function renderProject(
       mediaFile: typeof project.mediaFiles[0];
       trackIndex: number;
     }> = [];
+    const textOverlays = videoTracks
+      .flatMap(track => track.clips)
+      .filter(clip => Boolean(clip.textOverlay))
+      .map(clip => ({
+        startTime: clip.startTime,
+        endTime: clip.startTime + (clip.textOverlay?.duration ?? 0),
+        overlay: clip.textOverlay!,
+      }))
+      .filter(item => item.endTime > item.startTime)
+      .sort((a, b) => a.startTime - b.startTime);
 
     videoTracks.forEach((track, trackIndex) => {
       track.clips.forEach(clip => {
@@ -238,7 +288,7 @@ export async function renderProject(
 
     allAudioClips.sort((a, b) => a.clip.startTime - b.clip.startTime);
 
-    if (allVideoClips.length === 0 && allAudioClips.length === 0) {
+    if (allVideoClips.length === 0 && allAudioClips.length === 0 && textOverlays.length === 0) {
       throw new Error('No clips to render');
     }
 
@@ -292,6 +342,21 @@ export async function renderProject(
         const clipStart = item.clip.startTime;
         const trimStart = item.clip.trimStart;
         const inputIdx = inputMap.get(item.mediaFile.id)!;
+        const transform = item.clip.transform ?? { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+        const crop = item.clip.crop ?? { left: 0, right: 0, top: 0, bottom: 0 };
+        const cropLeft = clampCrop(crop.left);
+        const cropRight = clampCrop(crop.right);
+        const cropTop = clampCrop(crop.top);
+        const cropBottom = clampCrop(crop.bottom);
+        const cropWExpr = `iw*(1-${cropLeft.toFixed(6)}-${cropRight.toFixed(6)})`;
+        const cropHExpr = `ih*(1-${cropTop.toFixed(6)}-${cropBottom.toFixed(6)})`;
+        const cropXExpr = `iw*${cropLeft.toFixed(6)}`;
+        const cropYExpr = `ih*${cropTop.toFixed(6)}`;
+        const scaleX = Math.max(0.1, transform.scaleX || 1);
+        const scaleY = Math.max(0.1, transform.scaleY || 1);
+        const transX = Number.isFinite(transform.x) ? transform.x : 0;
+        const transY = Number.isFinite(transform.y) ? transform.y : 0;
+        const rotation = Number.isFinite(transform.rotation) ? transform.rotation : 0;
 
         const gap = clipStart - currentT;
         if (gap > frameDur) {
@@ -303,6 +368,8 @@ export async function renderProject(
           videoSegments.push(`[${lbl}]`);
         }
 
+        const baseLbl = `s${segIdx++}`;
+        const fgLbl = `s${segIdx++}`;
         const lbl = `s${segIdx++}`;
         const videoEffects: string[] = [];
         if (item.clip.reverse) {
@@ -312,8 +379,17 @@ export async function renderProject(
         filterParts.push(
           `[${inputIdx}:v]trim=start=${trimStart.toFixed(6)}:duration=${sourceDuration.toFixed(6)},` +
           `${videoEffects.join(',')},fps=${settings.framerate},` +
-          `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,` +
-          `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2,` +
+          `crop=${cropWExpr}:${cropHExpr}:${cropXExpr}:${cropYExpr},` +
+          `scale=iw*${scaleX.toFixed(6)}:ih*${scaleY.toFixed(6)},` +
+          `rotate=${(rotation * Math.PI / 180).toFixed(8)}:ow=rotw(iw):oh=roth(ih):c=none,` +
+          `format=rgba[${fgLbl}]`
+        );
+        filterParts.push(
+          `color=c=black:s=${settings.width}x${settings.height}:r=${settings.framerate}:d=${clipDuration.toFixed(6)},` +
+          `format=rgba[${baseLbl}]`
+        );
+        filterParts.push(
+          `[${baseLbl}][${fgLbl}]overlay=x=(W-w)/2+${transX.toFixed(4)}:y=(H-h)/2+${transY.toFixed(4)}:format=auto,` +
           `format=yuv420p,setsar=1[${lbl}]`
         );
         videoSegments.push(`[${lbl}]`);
@@ -333,6 +409,35 @@ export async function renderProject(
       filterParts.push(
         `${videoSegments.join('')}concat=n=${videoSegments.length}:v=1:a=0[vout]`
       );
+    } else if (textOverlays.length > 0) {
+      filterParts.push(
+        `color=c=black:s=${settings.width}x${settings.height}:r=${settings.framerate}:d=${outputDuration.toFixed(6)},` +
+        `format=yuv420p[vout]`
+      );
+      videoSegments.push('[vout]');
+    }
+
+    // --- TEXT OVERLAYS ---
+    if (textOverlays.length > 0) {
+      let sourceLabel = 'vout';
+      textOverlays.forEach((item, index) => {
+        const text = escapeDrawtext(item.overlay.content);
+        const color = escapeDrawtext(item.overlay.color || '#ffffff');
+        const bg = item.overlay.backgroundColor ? `:box=1:boxcolor=${escapeDrawtext(item.overlay.backgroundColor)}:boxborderw=8` : '';
+        const drawX = item.overlay.align === 'left'
+          ? `w*${Math.max(0, Math.min(1, item.overlay.x)).toFixed(4)}`
+          : item.overlay.align === 'right'
+            ? `w*${Math.max(0, Math.min(1, item.overlay.x)).toFixed(4)}-text_w`
+            : `w*${Math.max(0, Math.min(1, item.overlay.x)).toFixed(4)}-text_w/2`;
+        const drawY = `h*${Math.max(0, Math.min(1, item.overlay.y)).toFixed(4)}-text_h/2`;
+        const outLabel = index === textOverlays.length - 1 ? 'vout_text' : `vtxt${index}`;
+        filterParts.push(
+          `[${sourceLabel}]drawtext=text='${text}':fontcolor=${color}:fontsize=${Math.max(8, Math.round(item.overlay.fontSize))}:` +
+          `x=${drawX}:y=${drawY}:font='${escapeDrawtext(item.overlay.fontFamily)}':` +
+          `enable='between(t,${item.startTime.toFixed(6)},${item.endTime.toFixed(6)})'${bg}[${outLabel}]`
+        );
+        sourceLabel = outLabel;
+      });
     }
 
     // --- AUDIO TIMELINE (concat) ---
@@ -400,7 +505,7 @@ export async function renderProject(
 
     // Map outputs
     if (videoSegments.length > 0) {
-      args.push('-map', '[vout]');
+      args.push('-map', textOverlays.length > 0 ? '[vout_text]' : '[vout]');
     }
     if (audioSegments.length > 0) {
       args.push('-map', '[aout]');
@@ -484,7 +589,10 @@ export async function renderProject(
     });
 
     const data = await ffmpeg.readFile(outputFileName);
-    const blob = new Blob([data], { type: `video/${outputFormat}` });
+    const sourceBytes = data instanceof Uint8Array ? data : new Uint8Array();
+    const bytes = new Uint8Array(sourceBytes.byteLength);
+    bytes.set(sourceBytes);
+    const blob = new Blob([bytes], { type: `video/${outputFormat}` });
 
     // Clean up files in background. In ffmpeg.wasm, aggressive parallel deletes
     // can occasionally trigger an "Aborted()" even after a successful encode.

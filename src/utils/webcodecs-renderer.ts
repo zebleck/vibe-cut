@@ -13,6 +13,10 @@ export function isWebCodecsSupported(): boolean {
   );
 }
 
+function clampCrop(value: number): number {
+  return Math.max(0, Math.min(0.45, value));
+}
+
 // ---------------------------------------------------------------------------
 // MP4 Demuxer — extracts encoded video samples using MP4Box.js
 // ---------------------------------------------------------------------------
@@ -139,6 +143,10 @@ export async function renderWithWebCodecs(
         .filter(item => item.mediaFile),
     )
     .sort((a, b) => a.clip.startTime - b.clip.startTime);
+  const textClips = videoTracks
+    .flatMap(track => track.clips)
+    .filter(clip => Boolean(clip.textOverlay))
+    .map(clip => ({ clip, overlay: clip.textOverlay! }));
 
   const hasVideo = videoClips.length > 0;
   const hasAudio = audioClips.length > 0;
@@ -408,10 +416,29 @@ export async function renderWithWebCodecs(
           await advanceDecoder(cd, clipTimeUs);
           const frame = pickFrame(cd, clipTimeUs);
           if (frame) {
-            const vw = frame.displayWidth, vh = frame.displayHeight;
-            const scale = Math.min(settings.width / vw, settings.height / vh);
-            const dw = vw * scale, dh = vh * scale;
-            ctx.drawImage(frame as any, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
+            const vw = frame.displayWidth;
+            const vh = frame.displayHeight;
+            const transform = clip.transform ?? { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+            const crop = clip.crop ?? { left: 0, right: 0, top: 0, bottom: 0 };
+            const cropLeft = clampCrop(crop.left);
+            const cropRight = clampCrop(crop.right);
+            const cropTop = clampCrop(crop.top);
+            const cropBottom = clampCrop(crop.bottom);
+            const sx = vw * cropLeft;
+            const sy = vh * cropTop;
+            const sw = Math.max(1, vw * (1 - cropLeft - cropRight));
+            const sh = Math.max(1, vh * (1 - cropTop - cropBottom));
+            const fit = Math.min(settings.width / sw, settings.height / sh);
+            const dw = sw * fit * transform.scaleX;
+            const dh = sh * fit * transform.scaleY;
+            const cx = settings.width / 2 + transform.x;
+            const cy = settings.height / 2 + transform.y;
+
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate((transform.rotation * Math.PI) / 180);
+            ctx.drawImage(frame as any, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
+            ctx.restore();
           }
           continue;
         }
@@ -420,11 +447,56 @@ export async function renderWithWebCodecs(
         const video = fallbackVideos.get(mediaFile.id);
         if (video) {
           await seekVideo(video, clipTime);
-          const vw = video.videoWidth, vh = video.videoHeight;
-          const scale = Math.min(settings.width / vw, settings.height / vh);
-          const dw = vw * scale, dh = vh * scale;
-          ctx.drawImage(video, (settings.width - dw) / 2, (settings.height - dh) / 2, dw, dh);
+          const vw = video.videoWidth;
+          const vh = video.videoHeight;
+          const transform = clip.transform ?? { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 };
+          const crop = clip.crop ?? { left: 0, right: 0, top: 0, bottom: 0 };
+          const cropLeft = clampCrop(crop.left);
+          const cropRight = clampCrop(crop.right);
+          const cropTop = clampCrop(crop.top);
+          const cropBottom = clampCrop(crop.bottom);
+          const sx = vw * cropLeft;
+          const sy = vh * cropTop;
+          const sw = Math.max(1, vw * (1 - cropLeft - cropRight));
+          const sh = Math.max(1, vh * (1 - cropTop - cropBottom));
+          const fit = Math.min(settings.width / sw, settings.height / sh);
+          const dw = sw * fit * transform.scaleX;
+          const dh = sh * fit * transform.scaleY;
+          const cx = settings.width / 2 + transform.x;
+          const cy = settings.height / 2 + transform.y;
+
+          ctx.save();
+          ctx.translate(cx, cy);
+          ctx.rotate((transform.rotation * Math.PI) / 180);
+          ctx.drawImage(video, sx, sy, sw, sh, -dw / 2, -dh / 2, dw, dh);
+          ctx.restore();
         }
+      }
+
+      for (const { clip, overlay } of textClips) {
+        const endTime = clip.startTime + overlay.duration;
+        if (time < clip.startTime || time >= endTime) continue;
+
+        ctx.save();
+        ctx.font = `${overlay.fontStyle} ${overlay.fontWeight} ${Math.max(8, Math.round(overlay.fontSize))}px ${overlay.fontFamily}`;
+        ctx.fillStyle = overlay.color;
+        ctx.textAlign = overlay.align;
+        ctx.textBaseline = 'middle';
+
+        const textX = overlay.x * settings.width;
+        const textY = overlay.y * settings.height;
+        if (overlay.backgroundColor) {
+          const metrics = ctx.measureText(overlay.content);
+          const textWidth = metrics.width;
+          const alignOffset = overlay.align === 'left' ? 0 : overlay.align === 'right' ? -textWidth : -(textWidth / 2);
+          const boxX = textX + alignOffset - 8;
+          const boxY = textY - overlay.fontSize * 0.6;
+          ctx.fillStyle = overlay.backgroundColor;
+          ctx.fillRect(boxX, boxY, textWidth + 16, overlay.fontSize * 1.2);
+          ctx.fillStyle = overlay.color;
+        }
+        ctx.fillText(overlay.content, textX, textY);
+        ctx.restore();
       }
 
       const outFrame = new VideoFrame(canvas, { timestamp: Math.round(f * frameDurationUs) });
